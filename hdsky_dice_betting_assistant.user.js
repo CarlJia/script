@@ -16,6 +16,10 @@
 
     // 数据面板：扫描全站主题时两次请求间的短延迟，缓解论坛限流
     const SCAN_FETCH_DELAY_MS = 300;
+    // 一键大小的第二注按此节奏重试，论坛限制同一用户连续发帖的间隔
+    const SECOND_BET_FIRST_DELAY_MS = 3000;
+    const SECOND_BET_RETRY_MS = 10000;
+    const SECOND_BET_MAX_ATTEMPTS = 12;
     const STATS_PANEL_COLLAPSED_KEY = 'hdsky-dice-stats-panel:collapsed';
     const STATS_PANEL_ID = 'hdsky-dice-stats-panel';
 
@@ -44,6 +48,20 @@
             }
         }
         return null;
+    }
+
+    // 成功回帖会返回重定向；浏览器对手动重定向可能暴露为 opaqueredirect
+    function isSuccessfulBetResponse(response) {
+        return response.status === 302 || response.type === 'opaqueredirect';
+    }
+
+    // 论坛拒绝发帖时不重定向，而是用 200 渲染错误页，拒绝原因只能从页面文案里取
+    async function readForumRejection(response) {
+        const html = await response.text().catch(() => '');
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const node = doc.querySelector('td.text') || doc.querySelector('title');
+        const text = node ? node.textContent.replace(/\s+/g, ' ').trim() : '';
+        return text ? text.slice(0, 120) : '状态 ' + response.status;
     }
 
     // 获取帖子的总页数（从解析的HTML中）
@@ -177,6 +195,57 @@
             input.style.borderRadius = '3px';
             input.style.fontSize = '12px';
 
+            const submitBet = (btnName, amount) => {
+                const body = encodeURIComponent(btnName + ' ' + amount);
+                const formData = `id=${topicid}&type=reply&body=${body}`;
+
+                return fetch('https://hdsky.me/forums.php?action=post', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: formData,
+                    redirect: 'manual'
+                }).then(async response => {
+                    if (isSuccessfulBetResponse(response)) return;
+                    const error = new Error('论坛未确认投注（' + await readForumRejection(response) + '）');
+                    // 只有论坛明确渲染了拒绝页才可安全重试；其他情况服务端可能已经收单
+                    error.rejectedByForum = response.status === 200;
+                    throw error;
+                });
+            };
+
+            const submitBetUntilAccepted = async (btnName, amount, onWait) => {
+                for (let attempt = 1; ; attempt++) {
+                    onWait(attempt);
+                    await sleep(attempt === 1 ? SECOND_BET_FIRST_DELAY_MS : SECOND_BET_RETRY_MS);
+                    try {
+                        await submitBet(btnName, amount);
+                        return;
+                    } catch (error) {
+                        if (!error.rejectedByForum || attempt >= SECOND_BET_MAX_ATTEMPTS) throw error;
+                    }
+                }
+            };
+
+            const refreshSummary = () => {
+                summarySpan.textContent = '加载中...';
+                return getBetSummaryForTopic(topicid, username).then(summary => {
+                    if (summary) {
+                        let text = '';
+                        BET_TYPES.forEach(type => {
+                            if (summary[type] > 0) {
+                                text += type + ':' + summary[type] + ' ';
+                            }
+                        });
+                        const total = Object.values(summary).reduce((a, b) => a + b, 0);
+                        summarySpan.textContent = '(' + text.trim() + ' 共' + total + ')';
+                    } else {
+                        summarySpan.textContent = '(无投注)';
+                    }
+                });
+            };
+
             BET_TYPES.forEach(btnName => {
                 const btn = document.createElement('button');
                 btn.textContent = btnName;
@@ -196,30 +265,58 @@
                         return;
                     }
 
-                    const body = encodeURIComponent(btnName + ' ' + amount);
-                    const formData = `id=${topicid}&type=reply&body=${body}`;
-
-                    fetch('https://hdsky.me/forums.php?action=post', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                        },
-                        body: formData
-                    })
-                    .then(response => {
-                        if (response.ok) {
+                    submitBet(btnName, amount)
+                        .then(() => {
+                            refreshSummary();
                             alert('投注成功: ' + btnName + ' ' + amount);
-                        } else {
-                            alert('投注失败');
-                        }
-                    })
-                    .catch(error => {
-                        alert('投注请求出错: ' + error);
-                    });
+                        })
+                        .catch(error => alert('投注请求出错: ' + error.message));
                 });
 
                 container.appendChild(btn);
             });
+
+            const comboBtn = document.createElement('button');
+            comboBtn.textContent = '一键大小';
+            comboBtn.title = '先下注大，再自动下注小；论坛限制发帖间隔时会自动重试';
+            comboBtn.style.padding = '2px 8px';
+            comboBtn.style.cursor = 'pointer';
+            comboBtn.style.border = '1px solid #d97706';
+            comboBtn.style.borderRadius = '3px';
+            comboBtn.style.backgroundColor = '#f59e0b';
+            comboBtn.style.color = 'white';
+            comboBtn.style.fontSize = '12px';
+            comboBtn.style.marginRight = '3px';
+
+            comboBtn.addEventListener('click', async () => {
+                const amount = input.value;
+                if (amount < 100 || amount > 100000) {
+                    alert('请输入100-100000之间的数字');
+                    return;
+                }
+
+                comboBtn.disabled = true;
+                comboBtn.style.cursor = 'wait';
+                comboBtn.textContent = '下注中...';
+                let bigPlaced = false;
+                try {
+                    await submitBet('大', amount);
+                    bigPlaced = true;
+                    await submitBetUntilAccepted('小', amount, attempt => {
+                        comboBtn.textContent = '等待下注小 ' + attempt + '/' + SECOND_BET_MAX_ATTEMPTS;
+                    });
+                    alert('投注成功: 大 ' + amount + '，小 ' + amount);
+                } catch (error) {
+                    alert((bigPlaced ? '大已下注，但小投注失败: ' : '一键大小投注失败，大未下注: ') + error.message);
+                } finally {
+                    if (bigPlaced) refreshSummary();
+                    comboBtn.disabled = false;
+                    comboBtn.style.cursor = 'pointer';
+                    comboBtn.textContent = '一键大小';
+                }
+            });
+
+            container.appendChild(comboBtn);
 
             container.insertBefore(input, container.firstChild);
 
