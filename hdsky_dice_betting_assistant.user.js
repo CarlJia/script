@@ -33,7 +33,7 @@
 
     // 获取当前用户名
     function getCurrentUsername() {
-        const userLink = document.querySelector('a[class="User_Name"] b, a[class="SysOp_Name"] b, a[class="Administrator_Name"] b, a[class="NexusMaster_Name"] b, a[class="Moderator_Name"] b, a[class="VIP_Name"] b');
+        const userLink = document.querySelector('a[class$="_Name"] b');
         return userLink ? userLink.textContent.trim() : null;
     }
 
