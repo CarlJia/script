@@ -4,7 +4,7 @@
 // @version      1.0
 // @description  在论坛列表页每个帖子显示投注汇总和投注按钮
 // @match        https://hdsky.me/forums.php?action=viewforum&forumid=71
-// @match        https://hdsky.me/messages.php?action=viewmailbox&box=1
+// @match        https://hdsky.me/messages.php*
 // @grant        none
 // ==/UserScript==
 
@@ -839,11 +839,19 @@
 
     // 按页面路由初始化：列表页 → 既有投注按钮 + 数据面板；站内信页 → 清理面板
     const href = location.href;
-    if (href.indexOf('messages.php?action=viewmailbox&box=1') !== -1) {
-        try {
-            initCleanPanel();
-        } catch (e) {
-            console.error('初始化清理面板失败:', e);
+    if (href.indexOf('messages.php') !== -1) {
+        // 仅在"收件箱列表"页面渲染清理面板:action=viewmailbox 或无 action(默认 = 收件箱),且 box=1 或无 box
+        // 其他 messages 子页面(viewmessage 单条详情、editmailboxes 短讯箱管理、box=0 已发送 等)不挂任何面板
+        const params = new URLSearchParams(href.split('?')[1] || '');
+        const action = params.get('action');
+        const box = params.get('box');
+        const isInbox = (action === null || action === 'viewmailbox') && (box === null || box === '1');
+        if (isInbox) {
+            try {
+                initCleanPanel();
+            } catch (e) {
+                console.error('初始化清理面板失败:', e);
+            }
         }
     } else {
         addBetButtons();
