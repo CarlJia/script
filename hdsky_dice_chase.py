@@ -332,10 +332,11 @@ class ForumClient:
             raise SessionExpired(
                 f"列表页返回 {response.status}（很可能是会话失效后被重定向到登录页）"
             )
-        if LOGIN_MARKER_RE.search(response.final_url or "") and LIST_ROUND_MARKER not in response.body:
-            raise SessionExpired("列表页被重定向到了登录页，会话已失效")
-        if LIST_ROUND_MARKER not in response.body and LOGIN_MARKER_RE.search(response.body[:4000]):
-            raise SessionExpired("列表页返回的是登录页内容，会话已失效")
+        if LIST_ROUND_MARKER not in response.body and (
+            LOGIN_MARKER_RE.search(response.final_url or "")
+            or LOGIN_MARKER_RE.search(response.body[:4000])
+        ):
+            raise SessionExpired("列表页是登录页内容，会话已失效")
         return response.body
 
     # -- 写 ---------------------------------------------------------------
@@ -835,7 +836,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOG.error("配置错误: %s", exc)
         return 2
 
-    setup_logging(logging.DEBUG if args.verbose else logging.INFO, cfg.log_file)
+    if cfg.log_file:
+        # 已经在 setup_logging 里建好 stdout handler；现在追加文件 handler
+        logging.getLogger().addHandler(logging.FileHandler(cfg.log_file, encoding="utf-8"))
 
     stop = StopFlag()
     install_signal_handlers(stop)
