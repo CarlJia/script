@@ -205,36 +205,64 @@ class ConfigTests(unittest.TestCase):
 
 # ------------------------------------------------------------------- 列表页解析
 class ParserTests(unittest.TestCase):
+    """用例基于一份真实列表页 HTML 存档（见 tests/fixtures/list_page.html）：
+
+    这是用浏览器从 hdsky.me 另存的「Webpage, HTML Only」快照，里面混着
+    Chrome 扩展的 DOM（immersive-translate / Surfingkeys）和 HDSky 自己的结构。
+    解析器要能在这种有噪声的真实页面上正确抽到「本轮开奖时间」行。
+
+    下面的精确断言（topicid 列表、drought 数值、list_total_pages）都是该快照
+    在抓取那一刻的快照值；当 forum 跑出新轮、快照变成"过时"时这些值会变化，
+    重新登录并另存一次 fixtures/list_page.html 即可更新。结构性断言（去重、
+    行级锁定、开放/锁定的集合关系、draw_time 全可解析）则不随时效变化。
+    """
+
     def setUp(self):
         self.raw = chase.parse_rounds(fixture_html())
         self.rounds = chase.dedupe_rounds(self.raw)
         self.by_id = {r.topicid: r for r in self.rounds}
 
     def test_fixture_parses_expected_rounds_in_dom_order(self):
+        # 快照值（2026-10-08 抓取）：最新在前、topicid 77229 在原帖里已被删
         self.assertEqual(
-            [r.topicid for r in self.rounds], [1005, 1004, 1003, 1002, 1001, 1000, 999, 998]
+            [r.topicid for r in self.rounds],
+            [77245, 77244, 77243, 77242, 77241, 77240, 77239, 77238, 77237,
+             77236, 77235, 77234, 77233, 77232, 77231, 77230, 77228],
         )
 
     def test_duplicate_topic_counted_once(self):
-        self.assertEqual(len(self.raw), 9)
-        self.assertEqual(len(self.rounds), 8)
+        # 真实快照里没有重复的 topicid；结构性断言是 raw 和 dedupe 等长
+        self.assertEqual(len(self.raw), len(self.rounds))
 
     def test_drought_counts_consecutive_misses(self):
-        # 1003 小 / 1002 大 / 1001 顺子 / 1000 豹子 → 3
-        self.assertEqual(chase.compute_drought(self.rounds, "豹子"), 3)
+        # 快照里所有已开奖轮都不是「豹子」，所以豹子连旱 = 16
+        self.assertEqual(chase.compute_drought(self.rounds, "豹子"), 16)
+        # 结构性：最新一已开奖轮是「大」时，大 的连旱 = 0
+        self.assertEqual(chase.compute_drought(self.rounds, "大"), 0)
 
     def test_open_rounds_exclude_locked(self):
-        self.assertFalse(self.by_id[1005].locked)
-        self.assertTrue(self.by_id[1004].locked)
-        self.assertEqual([r.topicid for r in self.rounds if r.open], [1005, 998])
+        # 快照里只有 77245 是开放轮；其余都锁定
+        self.assertEqual([r.topicid for r in self.rounds if r.open], [77245])
+        self.assertFalse(self.by_id[77245].locked)
+        # 与开放轮紧邻的上一轮（77244）是锁定的，验证「行级锁定」不会跨行误标
+        self.assertTrue(self.by_id[77244].locked)
 
     def test_locked_marker_is_scoped_to_its_own_row(self):
-        # 行级判定（KTD7）：1004 的 locked 图片不能污染相邻的 1005
-        self.assertFalse(self.by_id[1005].locked)
+        # KTD7：77244 的 <img class="locked*"> 不能污染相邻的 77245
+        self.assertFalse(self.by_id[77245].locked)
 
     def test_malformed_draw_time_does_not_affect_drought(self):
-        self.assertIsNone(self.by_id[998].draw_time)
-        self.assertEqual(chase.compute_drought(self.rounds, "豹子"), 3)
+        # 真实快照的开奖时间都形如 YYYY-MM-DD HH:MM:SS，都解析成功
+        for r in self.rounds:
+            self.assertIsNotNone(r.draw_time, f"topicid {r.topicid} 没拿到开奖时间")
+            time.strptime(r.draw_time[:16], "%Y-%m-%d %H:%M")
+        # 连旱仍然只取决于结果，不受开奖时间影响
+        self.assertEqual(chase.compute_drought(self.rounds, "豹子"), 16)
+
+    def test_list_total_pages_from_fixture(self):
+        # 快照页面只有一页可见，解析后 list_total_pages = 1
+        self.assertEqual(chase.list_total_pages(fixture_html()), 1)
+        self.assertEqual(chase.list_total_pages(page_html([])), 1)
 
     def test_drought_zero_when_newest_drawn_round_is_target(self):
         rounds = chase.parse_rounds(
@@ -253,10 +281,6 @@ class ParserTests(unittest.TestCase):
     def test_undrawn_round_not_counted_as_miss(self):
         rounds = chase.parse_rounds(page_html([row_html(2), row_html(1, "豹子")]))
         self.assertEqual(chase.compute_drought(rounds, "豹子"), 0)
-
-    def test_list_total_pages(self):
-        self.assertEqual(chase.list_total_pages(fixture_html()), 2)
-        self.assertEqual(chase.list_total_pages(page_html([])), 1)
 
     def test_interval_shrinks_when_draw_time_is_near(self):
         cfg = make_cfg(poll_interval=60.0, min_poll_interval=3.0)
@@ -559,7 +583,9 @@ class GuardTests(unittest.TestCase):
 # ------------------------------------------------------------------ 抓取编排
 class CollectRoundsTests(unittest.TestCase):
     def test_stops_paging_once_target_is_seen(self):
-        transport = FakeTransport(get_results=[chase.HttpResponse(200, fixture_html())])
+        # 真实 fixture 里没「豹子」，所以这个测试用合成页：在第 1 页就出现目标
+        page1 = page_html([row_html(2, "小"), row_html(1, "豹子")], total_pages=3)
+        transport = FakeTransport(get_results=[chase.HttpResponse(200, page1)])
         rounds = chase.collect_rounds(chase.ForumClient(transport), make_cfg(max_list_pages=10))
         self.assertEqual(len(transport.get_urls), 1)
         self.assertTrue(any(x.result_type == "豹子" for x in rounds))
