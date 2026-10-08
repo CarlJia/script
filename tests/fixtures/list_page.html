@@ -1,0 +1,66 @@
+<!doctype html>
+<!--
+  合成 fixture —— 不是真实抓取。
+
+  真实的列表页存档请用登录后的浏览器打开
+  forums.php?action=viewforum&forumid=71 另存覆盖本文件。计划 U3 的 Execution note
+  要求以真实页面为准；在那之前，本文件按 user.js 已在线验证过的结构复刻
+  （`本轮开奖时间` 链接文案 + `【类型 …】` 结果 + `img class="locked*"`），
+  用来把解析行为钉住，而不是用来证明真实页面长这样。
+-->
+<html lang="zh">
+<head><title>骰子 - HDSky</title></head>
+<body>
+<table class="torrents">
+<tr class="colhead"><td>主题</td><td>作者</td><td>回复</td></tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1005">本轮开奖时间 2026-10-08 15:00</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1004">本轮开奖时间 2026-10-08 14:55</a> <img class="locked" src="pic/locked.gif" alt="locked"></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1003">本轮开奖时间 2026-10-08 14:50 【 小 5,2,1 】</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1002">本轮开奖时间 2026-10-08 14:45 【 大 3,3,4 】</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1001">本轮开奖时间 2026-10-08 14:40 【 顺子 1,2,3 】</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1000">本轮开奖时间 2026-10-08 14:35 【 豹子 6,6,6 】</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=999">本轮开奖时间 2026-10-08 14:30 【 小 2,1,2 】</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<!-- 与上一条 1003 重复，用来验证去重 -->
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=1003">本轮开奖时间 2026-10-08 14:50 【 小 5,2,1 】</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+
+<!-- 开奖时间用了不支持的格式，用来验证它不会影响连旱计算 -->
+<tr>
+  <td class="rowfollow"><a href="forums.php?action=viewtopic&forumid=71&topicid=998">本轮开奖时间 2026/10/08 14:25</a></td>
+  <td class="rowfollow">someone</td>
+</tr>
+</table>
+<p class="pager"><a href="forums.php?action=viewforum&forumid=71&page=2">2</a></p>
+</body>
+</html>
