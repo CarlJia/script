@@ -541,6 +541,19 @@ def save_state(path: str, state: State) -> None:
     os.replace(tmp, path)
 
 
+def reset_run_state(state: State) -> bool:
+    """每次启动重置 armed 与连续下注计数,让阈值重新评估。
+
+    total_staked / bet_topicids / last_seen_topicid 保留:
+    - total_staked 是跨重启的累计护栏,语义不该因重启清零
+    - bet_topicids / last_seen_topicid 是去重记录,保留能避免重启后重复下注
+    """
+    changed = state.armed or state.consecutive_bets > 0
+    state.armed = False
+    state.consecutive_bets = 0
+    return changed
+
+
 def cap_blocker(state: State, cfg: Config) -> Optional[str]:
     if cfg.max_total_stake is not None and state.total_staked + cfg.amount > cfg.max_total_stake:
         return (
@@ -847,6 +860,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state, note = load_state(state_path)
     if note:
         LOG.warning("%s", note)
+    if reset_run_state(state):
+        LOG.info("本次启动重置追号态：armed 与连续下注计数清零,阈值将重新评估")
 
     client = ForumClient(UrllibTransport(cfg.cookie, cfg.user_agent))
 

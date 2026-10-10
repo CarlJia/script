@@ -476,6 +476,33 @@ class StateTests(unittest.TestCase):
         )
         self.assertIsNone(blocker)
 
+    def test_reset_run_state_clears_armed_and_consecutive_bets(self):
+        state = chase.State(armed=True, consecutive_bets=5)
+        self.assertTrue(chase.reset_run_state(state))
+        self.assertFalse(state.armed)
+        self.assertEqual(state.consecutive_bets, 0)
+
+    def test_reset_run_state_preserves_other_fields(self):
+        state = chase.State(
+            armed=True,
+            consecutive_bets=4,
+            total_staked=350,
+            bet_topicids=[1, 2, 3],
+            last_seen_topicid=999,
+        )
+        chase.reset_run_state(state)
+        self.assertFalse(state.armed)
+        self.assertEqual(state.consecutive_bets, 0)
+        self.assertEqual(state.total_staked, 350)
+        self.assertEqual(state.bet_topicids, [1, 2, 3])
+        self.assertEqual(state.last_seen_topicid, 999)
+
+    def test_reset_run_state_noop_when_already_clean(self):
+        state = chase.State()
+        self.assertFalse(chase.reset_run_state(state))
+        self.assertFalse(state.armed)
+        self.assertEqual(state.consecutive_bets, 0)
+
 
 class GuardTests(unittest.TestCase):
     def test_lock_blocks_second_instance(self):
@@ -616,6 +643,224 @@ class CollectRoundsTests(unittest.TestCase):
         )
         rounds = chase.collect_rounds(chase.ForumClient(transport), make_cfg(max_list_pages=2))
         self.assertEqual([x.topicid for x in rounds], [2, 1])
+
+
+# --------------------------------------------------------------- 主循环端到端
+class LoopTests(unittest.TestCase):
+    """用真实 fixture 驱动整个 run_loop —— 对应 plan 的「集成（离线）」一行。
+
+    不起网络：假 transport 返回本地 fixture，sleep_interruptibly 被 patch 掉
+    避免真等；循环的终止由 transport 在指定次数后置停机标志来触发。
+    """
+
+    def _drive(self, tmp, *, dry_run, stop_after_gets, stop_on_post=False, reset_state=False, **cfg_over):
+        defaults = dict(threshold=1, amount=100)
+        defaults.update(cfg_over)
+        cfg = make_cfg(
+            dry_run=dry_run,
+            state_file=os.path.join(tmp, "state.json"),
+            lock_file=os.path.join(tmp, "lock"),
+            **defaults,
+        )
+        html = fixture_html()
+        stop = chase.StopFlag()
+
+        class Transport:
+            def __init__(self):
+                self.gets = 0
+                self.posts = 0
+
+            def get(self, url):
+                self.gets += 1
+                if self.gets >= stop_after_gets:
+                    stop.requested = True
+                return chase.HttpResponse(200, html)
+
+            def post(self, url, form):
+                self.posts += 1
+                if stop_on_post:
+                    stop.requested = True
+                return chase.HttpResponse(302, "")
+
+        transport = Transport()
+        client = chase.ForumClient(transport, sleep=lambda _s: None, clock=lambda: 0.0)
+        state, _ = chase.load_state(cfg.state_file)
+        # 模拟 main() 在加载后做的 reset_run_state —— 默认关闭,
+        # 显式打开才能测「armed 跨重启不继承」的契约。
+        if reset_state:
+            chase.reset_run_state(state)
+
+        logs = io.StringIO()
+        handler = logging.StreamHandler(logs)
+        chase.LOG.addHandler(handler)
+        previous_level = chase.LOG.level
+        chase.LOG.setLevel(logging.INFO)
+        self.addCleanup(chase.LOG.removeHandler, handler)
+        self.addCleanup(chase.LOG.setLevel, previous_level)
+
+        with mock.patch.object(chase, "sleep_interruptibly"):
+            code = chase.run_loop(cfg, client, state, stop, cfg.state_file)
+        return code, state, transport, logs.getvalue()
+
+    def test_dry_run_loop_logs_intent_once_and_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, state, transport, log = self._drive(tmp, dry_run=True, stop_after_gets=3)
+            saved, _ = chase.load_state(os.path.join(tmp, "state.json"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.posts, 0)
+        # 真实 fixture 连旱 16、阈值 1 → 追号态；开放轮只有 77245
+        self.assertIn("本应下注 豹子 100 @ topicid=77245", log)
+        # 三轮里同一 topicid 只播报一次（announced 集合去重）
+        self.assertEqual(log.count("本应下注"), 1)
+        # dry-run 不写已下注记录与投入
+        self.assertEqual(state.bet_topicids, [])
+        self.assertEqual(state.total_staked, 0)
+        # 但游标与追号态会推进
+        self.assertEqual(state.last_seen_topicid, 77245)
+        self.assertTrue(state.armed)
+        self.assertEqual(saved.last_seen_topicid, 77245)
+        self.assertTrue(saved.armed)
+
+    def test_live_loop_bets_the_open_round_and_records_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, state, transport, log = self._drive(
+                tmp, dry_run=False, stop_after_gets=2, stop_on_post=True
+            )
+            saved, note = chase.load_state(os.path.join(tmp, "state.json"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.posts, 1)
+        self.assertIn("下注成功", log)
+        self.assertEqual(state.bet_topicids, [77245])
+        self.assertEqual(state.total_staked, 100)
+        self.assertEqual(state.consecutive_bets, 1)
+        self.assertIsNone(note)
+        self.assertEqual(saved.bet_topicids, [77245])
+
+    def test_live_loop_posts_the_userscript_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                dry_run=False,
+                threshold=1,
+                amount=100,
+                state_file=os.path.join(tmp, "state.json"),
+                lock_file=os.path.join(tmp, "lock"),
+            )
+            captured = {}
+
+            class Transport:
+                def get(self, url):
+                    return chase.HttpResponse(200, fixture_html())
+
+                def post(self, url, form):
+                    captured["url"] = url
+                    captured["form"] = form
+                    stop.requested = True
+                    return chase.HttpResponse(302, "")
+
+            stop = chase.StopFlag()
+            client = chase.ForumClient(Transport(), sleep=lambda _s: None, clock=lambda: 0.0)
+            with mock.patch.object(chase, "sleep_interruptibly"):
+                chase.run_loop(cfg, client, chase.State(), stop, cfg.state_file)
+
+        self.assertEqual(captured["url"], "https://hdsky.me/forums.php?action=post")
+        self.assertEqual(captured["form"], {"id": "77245", "type": "reply", "body": "豹子 100"})
+
+    def test_loop_exits_when_spend_cap_would_be_exceeded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, state, transport, log = self._drive(
+                tmp, dry_run=False, stop_after_gets=3, amount=100, max_total_stake=50
+            )
+
+        self.assertEqual(code, 3)
+        self.assertEqual(transport.posts, 0)
+        self.assertIn("触发保险上限", log)
+        self.assertEqual(state.bet_topicids, [])
+        self.assertEqual(state.total_staked, 0)
+
+    def test_loop_exits_when_consecutive_cap_reached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 先写一份「历史连续下注已达上限」的状态，再启动
+            chase.save_state(
+                os.path.join(tmp, "state.json"), chase.State(consecutive_bets=1)
+            )
+            code, state, transport, log = self._drive(
+                tmp, dry_run=False, stop_after_gets=3, max_consecutive_bets=1, max_total_stake=None
+            )
+
+        self.assertEqual(code, 3)
+        self.assertEqual(transport.posts, 0)
+        self.assertIn("触发保险上限", log)
+        self.assertEqual(state.bet_topicids, [])
+
+    def test_session_expiry_mid_run_stops_the_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                threshold=1,
+                state_file=os.path.join(tmp, "state.json"),
+                lock_file=os.path.join(tmp, "lock"),
+            )
+
+            class Transport:
+                def get(self, url):
+                    return chase.HttpResponse(302, "", "https://hdsky.me/login.php")
+
+                def post(self, url, form):  # pragma: no cover - 不该走到这里
+                    raise AssertionError("会话失效后不应再下注")
+
+            client = chase.ForumClient(Transport(), sleep=lambda _s: None, clock=lambda: 0.0)
+            with mock.patch.object(chase, "sleep_interruptibly"):
+                with self.assertRaises(chase.SessionExpired):
+                    chase.run_loop(cfg, client, chase.State(), chase.StopFlag(), cfg.state_file)
+
+    def test_reset_state_does_not_resume_armed_when_threshold_unmet(self):
+        # 上一次运行留下了 armed=True / consecutive_bets=3,本次启动如果不做 reset,
+        # fixture 连旱 16 永远 < threshold=10000,就不会 arm,但 armed 残留会让循环
+        # 直接进入「挑开放轮」分支,把 77245 静默下掉 —— 这正是用户最初踩到的坑。
+        # _drive(reset_state=True) 模拟 main 的 reset_run_state,新阈值必须生效。
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "state.json")
+            chase.save_state(
+                state_path,
+                chase.State(armed=True, consecutive_bets=3, bet_topicids=[]),
+            )
+            code, state, transport, log = self._drive(
+                tmp,
+                dry_run=False,
+                stop_after_gets=2,
+                threshold=10000,
+                reset_state=True,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.posts, 0)
+        self.assertNotIn("下注成功", log)
+        self.assertFalse(state.armed)
+        self.assertEqual(state.consecutive_bets, 0)
+
+    def test_no_reset_lets_armed_resume_with_stale_state(self):
+        # 对照组:不模拟 main 的 reset,armed=True 的残留状态会让循环在连旱不足的情况下
+        # 也直接进入「挑开放轮」分支,把 fixture 里唯一开放轮 77245 静默下掉。
+        # 这条用例把「不 reset 会出事」钉死,避免 reset_run_state 被悄悄回滚。
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "state.json")
+            chase.save_state(
+                state_path,
+                chase.State(armed=True, consecutive_bets=3, bet_topicids=[]),
+            )
+            code, state, transport, log = self._drive(
+                tmp,
+                dry_run=False,
+                stop_after_gets=2,
+                stop_on_post=True,
+                threshold=10000,
+                reset_state=False,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.posts, 1, f"未 reset 时 armed 残留应继续追号,日志: {log}")
+        self.assertIn("下注成功", log)
 
 
 if __name__ == "__main__":
