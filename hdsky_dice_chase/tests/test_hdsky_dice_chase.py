@@ -404,7 +404,7 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(decision.bet_topicid, 5)
 
     def test_same_topic_is_never_bet_twice(self):
-        state = chase.State(armed=True, bet_topicids=[5])
+        state = chase.State(armed=True, bet_topicids=[(5, "豹子")])
         rounds = [r(5), r(4, "小"), r(3, "大"), r(2, "顺子"), r(1, "豹子")]
         decision = chase.decide(rounds, make_cfg(threshold=3), state)
         self.assertIsNone(decision.bet_topicid)
@@ -434,7 +434,7 @@ class StateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
             original = chase.State(
-                last_seen_topicid=7, armed=True, bet_topicids=[1, 2], total_staked=200, consecutive_bets=2
+                last_seen_topicid=7, armed=True, bet_topicids=[(1, "豹子"), (2, "豹子")], total_staked=200, consecutive_bets=2
             )
             chase.save_state(path, original)
             loaded, note = chase.load_state(path)
@@ -487,14 +487,14 @@ class StateTests(unittest.TestCase):
             armed=True,
             consecutive_bets=4,
             total_staked=350,
-            bet_topicids=[1, 2, 3],
+            bet_topicids=[(1, "豹子"), (2, "豹子"), (3, "豹子")],
             last_seen_topicid=999,
         )
         chase.reset_run_state(state)
         self.assertFalse(state.armed)
         self.assertEqual(state.consecutive_bets, 0)
         self.assertEqual(state.total_staked, 350)
-        self.assertEqual(state.bet_topicids, [1, 2, 3])
+        self.assertEqual(state.bet_topicids, [(1, "豹子"), (2, "豹子"), (3, "豹子")])
         self.assertEqual(state.last_seen_topicid, 999)
 
     def test_reset_run_state_noop_when_already_clean(self):
@@ -551,10 +551,10 @@ class GuardTests(unittest.TestCase):
             chase.place_bet_for_round(cfg, client, state, cfg.state_file, 1005, set())
             loaded, note = chase.load_state(cfg.state_file)
         self.assertIsNone(note)
-        self.assertEqual(state.bet_topicids, [1005])
+        self.assertEqual(state.bet_topicids, [(1005, "豹子")])
         self.assertEqual(state.total_staked, cfg.amount)
         self.assertEqual(state.consecutive_bets, 1)
-        self.assertEqual(loaded.bet_topicids, [1005])
+        self.assertEqual(loaded.bet_topicids, [(1005, "豹子")])
 
     def test_uncertain_bet_stops_without_recording(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -732,11 +732,11 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(transport.posts, 1)
         self.assertIn("下注成功", log)
-        self.assertEqual(state.bet_topicids, [77245])
+        self.assertEqual(state.bet_topicids, [(77245, "豹子")])
         self.assertEqual(state.total_staked, 100)
         self.assertEqual(state.consecutive_bets, 1)
         self.assertIsNone(note)
-        self.assertEqual(saved.bet_topicids, [77245])
+        self.assertEqual(saved.bet_topicids, [(77245, "豹子")])
 
     def test_live_loop_posts_the_userscript_form(self):
         with tempfile.TemporaryDirectory() as tmp:

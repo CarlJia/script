@@ -553,12 +553,65 @@ def _seconds_to_draw(rounds: Sequence[Round], now_ts: Optional[float] = None) ->
 class State:
     last_seen_topicid: int = 0
     armed: bool = False
-    bet_topicids: List[int] = field(default_factory=list)
+    # combo 模式扩展:每个元素是 (topicid, type) 元组;chase 模式下 type 固定为 cfg.target_type
+    bet_topicids: List[Tuple[int, str]] = field(default_factory=list)
     total_staked: int = 0
     consecutive_bets: int = 0
 
 
 SAFE_STATE_NOTE = "状态文件缺失或损坏：以「不追号、不补单」的安全默认启动"
+LEGACY_BET_TOPICIDS_NOTE = (
+    "状态文件 bet_topicids 为旧 chase 格式（纯 topicid 列表），"
+    "降级为不参与本次去重（armed=False 并清空 bet_topicids）"
+)
+
+
+def _normalize_bet_topicids(raw):
+    """把状态文件里读出的 bet_topicids 规范化为 List[Tuple[int, str]]。
+
+    - 空列表 → 空列表
+    - 全为 int → 旧 chase 格式，按 LEGACY_BET_TOPICIDS_NOTE 提示降级(返回空列表)
+    - 全为 [int, str] 列表 → 新格式
+    - 其它形态 → ValueError,触发 SAFE_STATE_NOTE 降级
+    """
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        raise ValueError("bet_topicids 必须是列表")
+    if not raw:
+        return [], None
+    if all(isinstance(x, int) for x in raw):
+        return [], LEGACY_BET_TOPICIDS_NOTE
+    out: List[Tuple[int, str]] = []
+    for x in raw:
+        if isinstance(x, (list, tuple)) and len(x) == 2:
+            topicid, btype = x
+            out.append((int(topicid), str(btype)))
+        else:
+            raise ValueError(f"bet_topicids 元素格式非法: {x!r}")
+    return out, None
+
+
+def state_bet_type(state: State, topicid: int, btype: str) -> bool:
+    """判断 (topicid, type) 是否已下注。
+
+    兼容新旧格式:
+    - 新格式(List[Tuple[int, str]]):精确按元组匹配
+    - 旧格式(纯 int 列表):元素不带类型,无法精确判定,默认返回 False
+    """
+    for entry in state.bet_topicids:
+        if isinstance(entry, tuple) and len(entry) == 2:
+            t, bt = entry
+            if t == topicid and bt == btype:
+                return True
+    return False
+
+
+def state_round_complete(
+    state: State, topicid: int, types: Sequence[str]
+) -> bool:
+    """判断该 topicid 是否已被 types 中所有类型覆盖(combo 模式完成判定)。"""
+    return all(state_bet_type(state, topicid, t) for t in types)
 
 
 def load_state(path: str):
@@ -574,16 +627,18 @@ def load_state(path: str):
     if not isinstance(raw, dict):
         return State(), SAFE_STATE_NOTE
     try:
+        bet_topicids, legacy_note = _normalize_bet_topicids(raw.get("bet_topicids"))
         state = State(
             last_seen_topicid=int(raw.get("last_seen_topicid") or 0),
-            armed=bool(raw.get("armed")),
-            bet_topicids=[int(x) for x in (raw.get("bet_topicids") or [])],
+            armed=bool(raw.get("armed")) if not legacy_note else False,
+            bet_topicids=bet_topicids,
             total_staked=int(raw.get("total_staked") or 0),
             consecutive_bets=int(raw.get("consecutive_bets") or 0),
         )
     except (TypeError, ValueError):
         return State(), SAFE_STATE_NOTE
-    return state, None
+    note = legacy_note
+    return state, note
 
 
 def save_state(path: str, state: State) -> None:
@@ -638,13 +693,22 @@ def decide(rounds: Sequence[Round], cfg: Config, state: State) -> Decision:
         state.armed = True
 
     decision = Decision(armed=state.armed, drought=drought)
+    if cfg.mode == "combo":
+        # combo 模式不依赖连旱 / armed;挑首个未完成 combo_types 覆盖的开放轮
+        for round_ in rounds:
+            if state_round_complete(state, round_.topicid, cfg.combo_types) or not round_.open:
+                continue
+            decision.bet_topicid = round_.topicid
+            return decision
+        decision.reason = "combo 模式下当前无可下注的开放轮"
+        return decision
+
     if not state.armed:
         decision.reason = f"连旱 {drought} < 阈值 {cfg.threshold}，待机"
         return decision
 
-    bet_already = set(state.bet_topicids)
     for round_ in rounds:
-        if round_.topicid in bet_already or not round_.open:
+        if state_bet_type(state, round_.topicid, cfg.target_type) or not round_.open:
             continue
         decision.bet_topicid = round_.topicid
         return decision
@@ -775,7 +839,7 @@ def place_bet_for_round(
         LOG.error("论坛拒绝下注，重试 %s 次后仍失败: %s", RETRY_MAX_ATTEMPTS, exc.reason)
         raise StopRun(5) from exc
 
-    state.bet_topicids.append(topicid)
+    state.bet_topicids.append((topicid, cfg.target_type))
     state.bet_topicids = state.bet_topicids[-MAX_REMEMBERED_BETS:]
     state.total_staked += cfg.amount
     state.consecutive_bets += 1
