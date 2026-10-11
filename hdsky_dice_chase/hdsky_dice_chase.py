@@ -144,12 +144,17 @@ class Config:
     state_file: str = "dice_chase_state.json"
     lock_file: str = "dice_chase.lock"
     log_file: Optional[str] = None
+    # combo 模式扩展(combo 模式与 chase 模式运行期互斥)
+    mode: str = "chase"
+    combo_amount: int = 100
+    combo_types: List[str] = field(default_factory=lambda: ["大", "小"])
 
 
 CONFIG_FIELDS = tuple(Config.__dataclass_fields__)
-INT_FIELDS = ("amount", "threshold", "max_list_pages")
+INT_FIELDS = ("amount", "threshold", "max_list_pages", "combo_amount")
 FLOAT_FIELDS = ("poll_interval", "min_poll_interval")
-STR_FIELDS = ("user_agent", "target_type", "state_file", "lock_file")
+STR_FIELDS = ("user_agent", "target_type", "state_file", "lock_file", "mode")
+LIST_FIELDS = ("combo_types",)
 OPTIONAL_INT_FIELDS = ("max_total_stake", "max_consecutive_bets")
 
 
@@ -206,6 +211,12 @@ def load_config(path: str, overrides: Optional[Dict[str, object]] = None) -> Con
                 setattr(cfg, name, _as_optional_int(merged[name]))
         if merged.get("dry_run") is not None:
             cfg.dry_run = bool(merged["dry_run"])
+        for name in LIST_FIELDS:
+            if merged.get(name) is not None:
+                value = merged[name]
+                if not isinstance(value, list):
+                    raise ConfigError(f"配置字段 {name} 必须是列表，当前为 {type(value).__name__}")
+                setattr(cfg, name, [str(x) for x in value])
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"配置字段类型不正确: {exc}")
 
@@ -214,10 +225,52 @@ def load_config(path: str, overrides: Optional[Dict[str, object]] = None) -> Con
 
 
 def validate_config(cfg: Config) -> None:
-    if cfg.target_type not in BET_TYPES:
+    if cfg.mode not in ("chase", "combo"):
         raise ConfigError(
-            "目标类型必须是 " + " / ".join(BET_TYPES) + f" 之一，当前为 {cfg.target_type!r}"
+            f"mode 必须是 'chase' 或 'combo' 之一，当前为 {cfg.mode!r}"
         )
+
+    if cfg.mode == "combo":
+        # combo 模式不要求 target_type 合法;若仍存在则日志 WARNING
+        if cfg.target_type not in BET_TYPES:
+            LOG.warning(
+                "target_type=%r 在 combo 模式下被忽略，请从配置中移除",
+                cfg.target_type,
+            )
+        # combo_amount 区间校验
+        if not AMOUNT_MIN <= cfg.combo_amount <= AMOUNT_MAX:
+            raise ConfigError(
+                f"combo_amount 必须在 {AMOUNT_MIN}–{AMOUNT_MAX} 之间，当前为 {cfg.combo_amount}"
+            )
+        # combo_types 校验:非空、长度≥2、每个元素∈BET_TYPES、元素互不重复
+        if not cfg.combo_types:
+            raise ConfigError("combo_types 不能为空")
+        if len(cfg.combo_types) < 2:
+            raise ConfigError(
+                f"combo_types 长度必须 >= 2，当前为 {len(cfg.combo_types)}: {cfg.combo_types}"
+            )
+        bad_types = [t for t in cfg.combo_types if t not in BET_TYPES]
+        if bad_types:
+            raise ConfigError(
+                f"combo_types 含非法元素 {bad_types}（合法类型: {BET_TYPES}）"
+            )
+        if len(set(cfg.combo_types)) != len(cfg.combo_types):
+            raise ConfigError(f"combo_types 元素互不重复，当前为 {cfg.combo_types}")
+        # amount 与 combo_amount 同时存在且不同值时 WARNING
+        if "amount" in cfg.__dataclass_fields__:  # always true
+            if cfg.amount != cfg.combo_amount:
+                LOG.warning(
+                    "检测到 amount=%s 与 combo_amount=%s 同时配置，combo 模式以 combo_amount 为准",
+                    cfg.amount,
+                    cfg.combo_amount,
+                )
+    else:
+        # chase 模式既有校验
+        if cfg.target_type not in BET_TYPES:
+            raise ConfigError(
+                "目标类型必须是 " + " / ".join(BET_TYPES) + f" 之一，当前为 {cfg.target_type!r}"
+            )
+
     if not AMOUNT_MIN <= cfg.amount <= AMOUNT_MAX:
         raise ConfigError(
             f"单注金额必须在 {AMOUNT_MIN}–{AMOUNT_MAX} 之间，当前为 {cfg.amount}"
@@ -820,18 +873,42 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--amount", type=int, help=f"单注金额（{AMOUNT_MIN}–{AMOUNT_MAX}）")
     parser.add_argument("--threshold", type=int, help="连旱阈值 N")
     parser.add_argument("--poll-interval", dest="poll_interval", type=float, help="轮询间隔（秒）")
+    parser.add_argument(
+        "--mode", choices=("chase", "combo"),
+        help="运行模式: chase（连旱追号）或 combo（每个新开轮下 combo_types 双注）",
+    )
+    parser.add_argument(
+        "--combo-amount", dest="combo_amount", type=int,
+        help=f"combo 模式单注金额（{AMOUNT_MIN}–{AMOUNT_MAX}）",
+    )
+    parser.add_argument(
+        "--combo-types", dest="combo_types", type=str,
+        help='combo 模式下的类型列表，JSON 格式，如 \'["大","小"]\'',
+    )
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     return parser.parse_args(argv)
 
 
 def cli_overrides(args: argparse.Namespace) -> Dict[str, object]:
-    return {
+    overrides: Dict[str, object] = {
         "dry_run": args.dry_run,
         "target_type": args.target_type,
         "amount": args.amount,
         "threshold": args.threshold,
         "poll_interval": args.poll_interval,
+        "mode": args.mode,
+        "combo_amount": args.combo_amount,
+        "combo_types": None,
     }
+    if args.combo_types is not None:
+        try:
+            parsed = json.loads(args.combo_types)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"--combo-types 必须是合法 JSON 列表: {exc}")
+        if not isinstance(parsed, list):
+            raise ConfigError("--combo-types 必须是 JSON 列表")
+        overrides["combo_types"] = parsed
+    return overrides
 
 
 def validate_session(client: ForumClient) -> None:
