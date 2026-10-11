@@ -16,5 +16,9 @@
 
   "state_file": "dice_chase_state.json",
   "lock_file": "dice_chase.lock",
-  "log_file": null
+  "log_file": null,
+
+  "mode": "chase",
+  "combo_amount": 100,
+  "combo_types": ["大", "小"]
 }
