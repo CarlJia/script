@@ -64,6 +64,9 @@ def make_cfg(**overrides):
         max_list_pages=10,
         state_file="state.json",
         lock_file="lock",
+        mode="chase",
+        combo_amount=100,
+        combo_types=["大", "小"],
     )
     base.update(overrides)
     return chase.Config(**base)
@@ -84,6 +87,9 @@ def write_config(directory, **overrides):
         state_file=os.path.join(directory, "state.json"),
         lock_file=os.path.join(directory, "lock"),
         log_file=None,
+        mode="chase",
+        combo_amount=100,
+        combo_types=["大", "小"],
     )
     data.update(overrides)
     path = os.path.join(directory, "config.json")
@@ -861,6 +867,242 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(transport.posts, 1, f"未 reset 时 armed 残留应继续追号,日志: {log}")
         self.assertIn("下注成功", log)
+
+
+# =========================================================== combo 模式测试
+class ComboConfigTests(unittest.TestCase):
+    def test_combo_mode_default_loads_with_defaults(self):
+        cfg = make_cfg(mode="combo", combo_amount=100, combo_types=["大", "小"])
+        self.assertEqual(cfg.mode, "combo")
+        self.assertEqual(cfg.combo_amount, 100)
+        self.assertEqual(cfg.combo_types, ["大", "小"])
+
+    def test_combo_amount_below_min_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="combo", combo_amount=50))
+
+    def test_combo_amount_above_max_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="combo", combo_amount=999999))
+
+    def test_combo_types_empty_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="combo", combo_types=[]))
+
+    def test_combo_types_too_short_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="combo", combo_types=["大"]))
+
+    def test_combo_types_invalid_element_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="combo", combo_types=["大", "非法"]))
+
+    def test_combo_types_duplicate_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="combo", combo_types=["大", "大"]))
+
+    def test_combo_mode_ignores_invalid_target_type_with_warning(self):
+        with self.assertLogs(chase.LOG, level="WARNING") as cm:
+            cfg = make_cfg(mode="combo", target_type="非法")
+            chase.validate_config(cfg)
+        self.assertTrue(any("target_type" in m for m in cm.output))
+
+    def test_combo_mode_amount_mismatch_logs_warning(self):
+        with self.assertLogs(chase.LOG, level="WARNING") as cm:
+            cfg = make_cfg(mode="combo", amount=999, combo_amount=100)
+            chase.validate_config(cfg)
+        self.assertTrue(any("amount" in m and "combo_amount" in m for m in cm.output))
+
+    def test_combo_field_round_trips_through_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_config(tmp, mode="combo", combo_amount=100, combo_types=["大", "小"])
+            cfg = chase.load_config(path)
+        self.assertEqual(cfg.mode, "combo")
+        self.assertEqual(cfg.combo_amount, 100)
+        self.assertEqual(cfg.combo_types, ["大", "小"])
+
+    def test_invalid_mode_string_rejected(self):
+        with self.assertRaises(chase.ConfigError):
+            chase.validate_config(make_cfg(mode="badmode"))
+
+
+class ComboStateTests(unittest.TestCase):
+    def test_state_bet_type_matches_tuple(self):
+        state = chase.State(bet_topicids=[(77535, "豹子"), (77536, "大")])
+        self.assertTrue(chase.state_bet_type(state, 77535, "豹子"))
+        self.assertTrue(chase.state_bet_type(state, 77536, "大"))
+        self.assertFalse(chase.state_bet_type(state, 77535, "大"))
+        self.assertFalse(chase.state_bet_type(state, 99999, "豹子"))
+
+    def test_state_round_complete_all_or_none(self):
+        state = chase.State(bet_topicids=[(1, "大"), (1, "小")])
+        self.assertTrue(chase.state_round_complete(state, 1, ["大", "小"]))
+        state2 = chase.State(bet_topicids=[(1, "大")])
+        self.assertFalse(chase.state_round_complete(state2, 1, ["大", "小"]))
+
+    def test_legacy_state_load_warns_and_drops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "last_seen_topicid": 999,
+                        "armed": True,
+                        "bet_topicids": [77535, 77536],
+                        "total_staked": 200,
+                        "consecutive_bets": 1,
+                    },
+                    fh,
+                )
+            state, note = chase.load_state(path)
+        self.assertIsNotNone(note)
+        self.assertIn("旧", note)
+        self.assertFalse(state.armed)
+        self.assertEqual(state.bet_topicids, [])
+        self.assertEqual(state.total_staked, 200)
+        self.assertEqual(state.last_seen_topicid, 999)
+
+
+class ComboExecutionTests(unittest.TestCase):
+    def test_combo_dry_run_prints_two_lines_and_no_post(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport()
+            client, _ = fake_client(transport)
+            state = chase.State()
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+        self.assertEqual(transport.post_calls, [])
+        self.assertEqual(state.bet_topicids, [])
+        self.assertFalse(os.path.exists(cfg.state_file))
+
+    def test_combo_two_bets_302_record_both_and_consecutive_increments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[chase.HttpResponse(302, ""), chase.HttpResponse(302, "")]
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+        self.assertEqual(
+            state.bet_topicids, [(1005, "大"), (1005, "小")]
+        )
+        self.assertEqual(state.total_staked, 200)
+        self.assertEqual(state.consecutive_bets, 1)
+
+    def test_combo_second_bet_rejected_uses_combo_retry_rhythm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[
+                    chase.HttpResponse(302, ""),  # 大 成功
+                    *[chase.HttpResponse(200, '<td class="text">请不要连续发帖</td>')]
+                    * chase.COMBO_MAX_ATTEMPTS,  # 小 12 次拒绝
+                ]
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            with self.assertRaises(chase.StopRun) as ctx_exc:
+                chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+        self.assertEqual(ctx_exc.exception.code, 5)
+        # 大已记下，小未记下，consecutive_bets 不递增
+        self.assertEqual(state.bet_topicids, [(1005, "大")])
+        self.assertEqual(state.total_staked, 100)
+        self.assertEqual(state.consecutive_bets, 0)
+
+    def test_combo_first_bet_rejected_twelve_times_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[chase.HttpResponse(200, '<td class="text">拒绝</td>')]
+                * chase.RETRY_MAX_ATTEMPTS
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            with self.assertRaises(chase.StopRun) as ctx_exc:
+                chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+        self.assertEqual(ctx_exc.exception.code, 5)
+        self.assertEqual(state.bet_topicids, [])
+
+    def test_combo_second_call_same_topicid_skips_already_bet_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport()
+            client, _ = fake_client(transport)
+            state = chase.State(bet_topicids=[(1005, "大"), (1005, "小")])
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+        self.assertEqual(transport.post_calls, [])
+
+
+class ComboDecideTests(unittest.TestCase):
+    def test_combo_picks_first_uncovered_open_round(self):
+        state = chase.State()
+        rounds = [r(3), r(2, "小"), r(1, "豹子")]
+        decision = chase.decide(rounds, make_cfg(mode="combo"), state)
+        self.assertEqual(decision.bet_topicid, 3)
+
+    def test_combo_skips_round_fully_covered_by_combo_types(self):
+        state = chase.State(bet_topicids=[(3, "大"), (3, "小")])
+        rounds = [r(3), r(2)]
+        decision = chase.decide(rounds, make_cfg(mode="combo"), state)
+        self.assertEqual(decision.bet_topicid, 2)
+
+    def test_combo_ignores_drought_threshold(self):
+        # chase 模式下 threshold=100 永远不可能触发 armed,combo 模式不依赖连旱
+        # 验证:drought 远小于 threshold,但 combo 仍然挑开放轮下注
+        state = chase.State()
+        rounds = [r(2, "豹子"), r(1)]  # round 1 是开放轮
+        decision = chase.decide(
+            rounds, make_cfg(mode="combo", threshold=100), state
+        )
+        self.assertEqual(decision.bet_topicid, 1)
+
+
+class ComboCapTests(unittest.TestCase):
+    def test_cap_blocker_combo_uses_combo_amount(self):
+        # total_staked=950, combo_amount=100, cap=1000 => 950+100 > 1000? 1050 > 1000 -> blocked
+        state = chase.State(total_staked=950)
+        blocker = chase.cap_blocker(
+            state, make_cfg(mode="combo", combo_amount=100, max_total_stake=1000), 100
+        )
+        self.assertIsNotNone(blocker)
+
+    def test_cap_blocker_chase_uses_amount(self):
+        # total_staked=950, amount=100, cap=1000 => 950+100 > 1000 -> blocked
+        state = chase.State(total_staked=950)
+        blocker = chase.cap_blocker(
+            state, make_cfg(mode="chase", amount=100, max_total_stake=1000), 100
+        )
+        self.assertIsNotNone(blocker)
 
 
 if __name__ == "__main__":
