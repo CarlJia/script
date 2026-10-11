@@ -1158,13 +1158,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOG.error("%s", exc)
         return 2
 
-    LOG.info(
-        "启动：目标=%s 金额=%s 阈值=%s %s",
-        cfg.target_type,
-        cfg.amount,
-        cfg.threshold,
-        "（dry-run，不会真实下注）" if cfg.dry_run else "（实盘，会真的花积分）",
-    )
+    if cfg.mode == "combo":
+        LOG.info(
+            "启动：mode=%s combo_types=%s combo_amount=%s %s",
+            cfg.mode,
+            cfg.combo_types,
+            cfg.combo_amount,
+            "（dry-run，不会真实下注）" if cfg.dry_run else "（实盘，会真的花积分）",
+        )
+    else:
+        LOG.info(
+            "启动：目标=%s 金额=%s 阈值=%s %s",
+            cfg.target_type,
+            cfg.amount,
+            cfg.threshold,
+            "（dry-run，不会真实下注）" if cfg.dry_run else "（实盘，会真的花积分）",
+        )
 
     try:
         return run_loop(cfg, client, state, stop, state_path)
