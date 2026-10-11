@@ -461,18 +461,18 @@ class StateTests(unittest.TestCase):
 
     def test_total_stake_cap(self):
         state = chase.State(total_staked=950000)
-        blocker = chase.cap_blocker(state, make_cfg(max_total_stake=1000000, amount=100000))
+        blocker = chase.cap_blocker(state, make_cfg(max_total_stake=1000000, amount=100000), 100000)
         self.assertIsNotNone(blocker)
 
     def test_consecutive_bet_cap(self):
         state = chase.State(consecutive_bets=20)
-        blocker = chase.cap_blocker(state, make_cfg(max_consecutive_bets=20))
+        blocker = chase.cap_blocker(state, make_cfg(max_consecutive_bets=20), 100000)
         self.assertIsNotNone(blocker)
 
     def test_caps_can_be_disabled(self):
         state = chase.State(total_staked=10**9, consecutive_bets=10**6)
         blocker = chase.cap_blocker(
-            state, make_cfg(max_total_stake=None, max_consecutive_bets=None)
+            state, make_cfg(max_total_stake=None, max_consecutive_bets=None), 100000
         )
         self.assertIsNone(blocker)
 

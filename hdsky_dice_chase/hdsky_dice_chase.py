@@ -54,6 +54,10 @@ REQUEST_TIMEOUT_S = 15.0
 RETRY_FIRST_DELAY_S = 3.0
 RETRY_DELAY_S = 10.0
 RETRY_MAX_ATTEMPTS = 12
+# combo 模式第二注及之后的重试节奏（与 user.js 一键大小按钮 SECOND_BET_* 一致）
+COMBO_FIRST_DELAY_S = 3.0
+COMBO_RETRY_DELAY_S = 10.0
+COMBO_MAX_ATTEMPTS = 12
 # 论坛限制同一用户连续发帖，两次 POST 之间的下限
 MIN_POST_INTERVAL_S = 3.0
 
@@ -446,6 +450,29 @@ def extract_rejection_reason(html: str) -> str:
     return "论坛拒绝了下注，但没有给出可读原因"
 
 
+def place_combo_bet_until_accepted(
+    client: "ForumClient",
+    topicid: int,
+    bet_type: str,
+    amount: int,
+    on_attempt: Optional[Callable[[int], None]] = None,
+) -> None:
+    """combo 模式第二注及之后的重试节奏（与 user.js 一键大小按钮 SECOND_BET_* 一致）。
+
+    只对论坛明确渲染的拒绝页重试;BetUncaught / 网络异常立即上抛。
+    """
+    for attempt in range(1, COMBO_MAX_ATTEMPTS + 1):
+        if on_attempt:
+            on_attempt(attempt)
+        client._sleep(COMBO_FIRST_DELAY_S if attempt == 1 else COMBO_RETRY_DELAY_S)
+        try:
+            client.place_bet(topicid, bet_type, amount)
+            return
+        except BetRejected:
+            if attempt >= COMBO_MAX_ATTEMPTS:
+                raise
+
+
 # ------------------------------------------------------------------ 列表页解析
 @dataclass
 class Round:
@@ -662,10 +689,14 @@ def reset_run_state(state: State) -> bool:
     return changed
 
 
-def cap_blocker(state: State, cfg: Config) -> Optional[str]:
-    if cfg.max_total_stake is not None and state.total_staked + cfg.amount > cfg.max_total_stake:
+def cap_blocker(state: State, cfg: Config, per_bet_amount: int) -> Optional[str]:
+    """按 cfg.mode 选用对应单注金额的护栏检查。
+
+    chase 模式 per_bet_amount=cfg.amount;combo 模式 per_bet_amount=cfg.combo_amount。
+    """
+    if cfg.max_total_stake is not None and state.total_staked + per_bet_amount > cfg.max_total_stake:
         return (
-            f"累计投入 {state.total_staked} + 本注 {cfg.amount} 会超过总投入上限 "
+            f"累计投入 {state.total_staked} + 本注 {per_bet_amount} 会超过总投入上限 "
             f"{cfg.max_total_stake}"
         )
     if cfg.max_consecutive_bets is not None and state.consecutive_bets + 1 > cfg.max_consecutive_bets:
@@ -853,6 +884,92 @@ def place_bet_for_round(
     save_state(state_path, state)
 
 
+def place_combo_for_round(
+    cfg: Config,
+    client: ForumClient,
+    state: State,
+    state_path: str,
+    topicid: int,
+    announced: set,
+) -> None:
+    """combo 模式下对该 topicid 顺序下 cfg.combo_types 的每个类型。
+
+    第一注按 chase 既定重试节奏(RETRY_*);第二注及之后按 user.js 一键大小节奏(COMBO_*)。
+    同一 (topicid, type) 已记录则跳过。全部 combo_types 成功完成后 consecutive_bets + 1。
+    失败(BetUncertain 或第二注及之后达到重试上限仍被拒)→ save_state + StopRun(4 或 5)。
+    """
+    assert cfg.mode == "combo", "place_combo_for_round 仅在 combo 模式调用"
+
+    if cfg.dry_run:
+        for btype in cfg.combo_types:
+            if state_bet_type(state, topicid, btype):
+                continue
+            if (topicid, btype) not in announced:
+                announced.add((topicid, btype))
+                LOG.info(
+                    "[combo] [dry-run] 本应下注 %s %s @ topicid=%s（未写入状态文件）",
+                    btype,
+                    cfg.combo_amount,
+                    topicid,
+                )
+        return
+
+    for index, btype in enumerate(cfg.combo_types):
+        if state_bet_type(state, topicid, btype):
+            continue
+        is_first = index == 0
+        on_attempt = (
+            lambda attempt, b=btype: LOG.info(
+                "[combo] 下注尝试 %s/%s @ topicid=%s type=%s",
+                attempt,
+                COMBO_MAX_ATTEMPTS if not is_first else RETRY_MAX_ATTEMPTS,
+                topicid,
+                b,
+            )
+        )
+        try:
+            if is_first:
+                client.place_bet_until_accepted(
+                    topicid, btype, cfg.combo_amount, on_attempt=on_attempt
+                )
+            else:
+                place_combo_bet_until_accepted(
+                    client, topicid, btype, cfg.combo_amount, on_attempt=on_attempt
+                )
+        except (BetUncertain, DiceNetworkError) as exc:
+            save_state(state_path, state)
+            LOG.error(
+                "[combo] 下注结果不明，已停手，请人工核对论坛侧是否已收到这一注: %s",
+                exc,
+            )
+            raise StopRun(4) from exc
+        except BetRejected as exc:
+            save_state(state_path, state)
+            max_attempts = RETRY_MAX_ATTEMPTS if is_first else COMBO_MAX_ATTEMPTS
+            LOG.error(
+                "[combo] 论坛拒绝下注，重试 %s 次后仍失败: %s",
+                max_attempts,
+                exc.reason,
+            )
+            raise StopRun(5) from exc
+
+        state.bet_topicids.append((topicid, btype))
+        state.bet_topicids = state.bet_topicids[-MAX_REMEMBERED_BETS:]
+        state.total_staked += cfg.combo_amount
+        LOG.info(
+            "[combo] 下注成功：%s %s @ topicid=%s（本次运行累计投入 %s）",
+            btype,
+            cfg.combo_amount,
+            topicid,
+            state.total_staked,
+        )
+
+    # 全部 combo_types 完成后递增连续计数（KTD5：每轮 +1）
+    if all(state_bet_type(state, topicid, t) for t in cfg.combo_types):
+        state.consecutive_bets += 1
+    save_state(state_path, state)
+
+
 def sleep_interruptibly(seconds: float, stop: StopFlag, chunk: float = 1.0) -> None:
     end = time.monotonic() + max(0.0, seconds)
     while not stop.requested:
@@ -863,7 +980,12 @@ def sleep_interruptibly(seconds: float, stop: StopFlag, chunk: float = 1.0) -> N
 
 
 def run_loop(cfg: Config, client: ForumClient, state: State, stop: StopFlag, state_path: str) -> int:
-    announced: set = set()
+    # chase 模式 anned 为 set[int];combo 模式为 set[Tuple[int, str]]
+    if cfg.mode == "combo":
+        announced: set = set()
+    else:
+        announced = set()
+    per_bet_amount = cfg.combo_amount if cfg.mode == "combo" else cfg.amount
     while not stop.requested:
         try:
             rounds = collect_rounds(client, cfg)
@@ -883,19 +1005,34 @@ def run_loop(cfg: Config, client: ForumClient, state: State, stop: StopFlag, sta
         decision = decide(rounds, cfg, state)
 
         if decision.bet_topicid is not None:
-            blocker = cap_blocker(state, cfg)
+            blocker = cap_blocker(state, cfg, per_bet_amount)
             if blocker:
                 save_state(state_path, state)
                 LOG.error("触发保险上限，停止投注并退出: %s", blocker)
                 return 3
-            place_bet_for_round(cfg, client, state, state_path, decision.bet_topicid, announced)
+            if cfg.mode == "combo":
+                place_combo_for_round(
+                    cfg, client, state, state_path, decision.bet_topicid, announced
+                )
+            else:
+                place_bet_for_round(
+                    cfg, client, state, state_path, decision.bet_topicid, announced
+                )
         else:
-            LOG.info(
-                "连旱 %s / 阈值 %s，%s",
-                decision.drought,
-                cfg.threshold,
-                decision.reason or "待机",
-            )
+            if cfg.mode == "combo":
+                LOG.info(
+                    "[combo] %s / 阈值 %s，%s",
+                    decision.drought,
+                    cfg.threshold,
+                    decision.reason or "待机",
+                )
+            else:
+                LOG.info(
+                    "连旱 %s / 阈值 %s，%s",
+                    decision.drought,
+                    cfg.threshold,
+                    decision.reason or "待机",
+                )
 
         newest = max((r.topicid for r in rounds), default=state.last_seen_topicid)
         if newest > state.last_seen_topicid:
