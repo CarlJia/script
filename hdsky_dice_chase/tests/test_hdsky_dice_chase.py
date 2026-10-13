@@ -335,6 +335,18 @@ class ClientTests(unittest.TestCase):
             chase.ForumClient(transport).place_bet(1005, "豹子", 100000)
         self.assertIn("请不要连续发帖", ctx.exception.reason)
 
+    def test_bet_200_without_recognized_refusal_is_uncertain_and_not_retried(self):
+        # 200 也可能出现在「帖子其实已经发出、只是没重定向」的告示页上。
+        # 认不出来的 200 不能当作可重试的拒绝 —— 重试就是真的重复下注。
+        transport = FakeTransport(
+            post_results=[chase.HttpResponse(200, '<td class="text">错误：页面已过期</td>')]
+        )
+        client, _ = fake_client(transport)
+        with self.assertRaises(chase.BetUncertain) as ctx:
+            client.place_bet_until_accepted(1005, "豹子", 100000)
+        self.assertEqual(len(transport.post_calls), 1)
+        self.assertIn("不确定论坛是否已收单", str(ctx.exception))
+
     def test_bet_unknown_status_is_uncertain(self):
         transport = FakeTransport(post_results=[chase.HttpResponse(403, "forbidden")])
         with self.assertRaises(chase.BetUncertain):
@@ -488,7 +500,8 @@ class StateTests(unittest.TestCase):
         self.assertFalse(state.armed)
         self.assertEqual(state.consecutive_bets, 0)
 
-    def test_reset_run_state_preserves_other_fields(self):
+    def test_reset_run_state_zeroes_run_counters_but_keeps_dedup_records(self):
+        """累计投入是「本次运行」的量，重启必须清零；去重记录与游标跨重启保留。"""
         state = chase.State(
             armed=True,
             consecutive_bets=4,
@@ -496,12 +509,18 @@ class StateTests(unittest.TestCase):
             bet_topicids=[(1, "豹子"), (2, "豹子"), (3, "豹子")],
             last_seen_topicid=999,
         )
-        chase.reset_run_state(state)
+        self.assertTrue(chase.reset_run_state(state))
         self.assertFalse(state.armed)
         self.assertEqual(state.consecutive_bets, 0)
-        self.assertEqual(state.total_staked, 350)
+        self.assertEqual(state.total_staked, 0)
         self.assertEqual(state.bet_topicids, [(1, "豹子"), (2, "豹子"), (3, "豹子")])
         self.assertEqual(state.last_seen_topicid, 999)
+
+    def test_reset_run_state_reports_change_when_only_total_staked_is_dirty(self):
+        # 只带上一次运行的累计投入（armed / consecutive_bets 已归零）也要算「重置过」
+        state = chase.State(total_staked=1100)
+        self.assertTrue(chase.reset_run_state(state))
+        self.assertEqual(state.total_staked, 0)
 
     def test_reset_run_state_noop_when_already_clean(self):
         state = chase.State()
@@ -659,7 +678,7 @@ class LoopTests(unittest.TestCase):
     避免真等；循环的终止由 transport 在指定次数后置停机标志来触发。
     """
 
-    def _drive(self, tmp, *, dry_run, stop_after_gets, stop_on_post=False, reset_state=False, **cfg_over):
+    def _drive(self, tmp, *, dry_run, stop_after_gets, stop_on_post=False, reset_state=False, html=None, **cfg_over):
         defaults = dict(threshold=1, amount=100)
         defaults.update(cfg_over)
         cfg = make_cfg(
@@ -668,7 +687,7 @@ class LoopTests(unittest.TestCase):
             lock_file=os.path.join(tmp, "lock"),
             **defaults,
         )
-        html = fixture_html()
+        html = html if html is not None else fixture_html()
         stop = chase.StopFlag()
 
         class Transport:
@@ -785,6 +804,56 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(state.bet_topicids, [])
         self.assertEqual(state.total_staked, 0)
 
+    def test_second_start_ignores_previous_runs_total_staked(self):
+        """回归：上次运行落盘的 total_staked=1100 不该让本次启动一注未下就触发保险上限。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            chase.save_state(
+                os.path.join(tmp, "state.json"),
+                chase.State(
+                    last_seen_topicid=77200,
+                    armed=True,
+                    bet_topicids=[(77200, "大"), (77200, "小")],
+                    total_staked=1100,
+                    consecutive_bets=0,
+                ),
+            )
+            code, state, transport, log = self._drive(
+                tmp,
+                dry_run=False,
+                stop_after_gets=3,
+                stop_on_post=True,
+                reset_state=True,
+                mode="combo",
+                combo_amount=100,
+                max_total_stake=1000,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("触发保险上限", log)
+        self.assertEqual(transport.posts, 2)
+        self.assertEqual(state.total_staked, 200)
+        self.assertIn("本次运行累计投入 200", log)
+
+    def test_combo_round_never_pushes_total_staked_over_the_cap(self):
+        """回归：整轮两注要一起过预算检查，单次运行内也不能越过 max_total_stake。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, state, transport, log = self._drive(
+                tmp,
+                dry_run=False,
+                stop_after_gets=5,
+                html=page_html([row_html(101), row_html(102), row_html(103)]),
+                mode="combo",
+                combo_amount=300,
+                max_total_stake=1000,
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn("触发保险上限", log)
+        # 第二轮（整轮 600）在预算检查处就被拦下，没有下出去
+        self.assertEqual(transport.posts, 2)
+        self.assertEqual(state.total_staked, 600)
+        self.assertLessEqual(state.total_staked, 1000)
+
     def test_loop_exits_when_consecutive_cap_reached(self):
         with tempfile.TemporaryDirectory() as tmp:
             # 先写一份「历史连续下注已达上限」的状态，再启动
@@ -870,6 +939,53 @@ class LoopTests(unittest.TestCase):
 
 
 # =========================================================== combo 模式测试
+class MainStartupTests(unittest.TestCase):
+    """main() 的启动接线：上一次运行落盘的 total_staked 必须在进入循环前清零。
+
+    上面 LoopTests 的 reset_state=True 是在测试里手工重放 main() 的重置动作，
+    钉住的是 reset_run_state 的语义；这里驱动真正的 main()，钉住「启动时会调用它」。
+    """
+
+    def _drive_main(self, tmp, state):
+        chase.save_state(os.path.join(tmp, "state.json"), state)
+        config_path = write_config(tmp)
+        seen = {}
+
+        def fake_run_loop(cfg, client, loop_state, stop, state_path):
+            seen["total_staked"] = loop_state.total_staked
+            seen["armed"] = loop_state.armed
+            seen["consecutive_bets"] = loop_state.consecutive_bets
+            return 0
+
+        with mock.patch.object(chase, "setup_logging"), mock.patch.object(
+            chase, "install_signal_handlers"
+        ), mock.patch.object(chase, "validate_session"), mock.patch.object(
+            chase, "acquire_lock", return_value=os.path.join(tmp, "lock")
+        ), mock.patch.object(chase, "run_loop", fake_run_loop):
+            code = chase.main(["--config", config_path])
+        return code, seen
+
+    def test_main_zeroes_previous_runs_run_state_before_the_loop(self):
+        """回归：main() 里那行 reset_run_state 被删掉/改坏时，这条会失败。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, seen = self._drive_main(
+                tmp,
+                chase.State(
+                    armed=True,
+                    total_staked=1100,
+                    consecutive_bets=2,
+                    bet_topicids=[(1, "大"), (1, "小")],
+                    last_seen_topicid=1,
+                ),
+            )
+
+        self.assertEqual(code, 0)
+        # 「本次运行」的量在进入循环前已清零
+        self.assertEqual(seen["total_staked"], 0)
+        self.assertFalse(seen["armed"])
+        self.assertEqual(seen["consecutive_bets"], 0)
+
+
 class ComboConfigTests(unittest.TestCase):
     def test_combo_mode_default_loads_with_defaults(self):
         cfg = make_cfg(mode="combo", combo_amount=100, combo_types=["大", "小"])
@@ -1037,7 +1153,9 @@ class ComboExecutionTests(unittest.TestCase):
                 state_file=os.path.join(tmp, "state.json"),
             )
             transport = FakeTransport(
-                post_results=[chase.HttpResponse(200, '<td class="text">拒绝</td>')]
+                post_results=[
+                    chase.HttpResponse(200, '<td class="text">请不要连续发帖，请稍后再试</td>')
+                ]
                 * chase.RETRY_MAX_ATTEMPTS
             )
             client, _ = fake_client(transport)
@@ -1046,6 +1164,29 @@ class ComboExecutionTests(unittest.TestCase):
                 chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
         self.assertEqual(ctx_exc.exception.code, 5)
         self.assertEqual(state.bet_topicids, [])
+
+    def test_combo_unknown_200_stops_without_duplicate_bet(self):
+        """认不出的 200 → 按结果不明停手（退出码 4），只发过一次 POST。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[chase.HttpResponse(200, '<td class="text">错误：页面已过期</td>')]
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            with self.assertRaises(chase.StopRun) as ctx_exc:
+                chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+            saved, _ = chase.load_state(cfg.state_file)
+        self.assertEqual(ctx_exc.exception.code, 4)
+        self.assertEqual(len(transport.post_calls), 1)
+        self.assertEqual(state.bet_topicids, [])
+        self.assertEqual(saved.total_staked, 0)
 
     def test_combo_second_call_same_topicid_skips_already_bet_types(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1088,6 +1229,32 @@ class ComboDecideTests(unittest.TestCase):
 
 
 class ComboCapTests(unittest.TestCase):
+    def test_pending_round_amount_counts_uncovered_types(self):
+        # 整轮预算 = 该轮还没下的类型数 × combo_amount；chase 模式就是单注金额
+        cfg = make_cfg(mode="combo", combo_amount=300, combo_types=["大", "小"])
+        self.assertEqual(chase.pending_round_amount(chase.State(), cfg, 8), 600)
+        self.assertEqual(
+            chase.pending_round_amount(chase.State(bet_topicids=[(7, "大")]), cfg, 7), 300
+        )
+        self.assertEqual(
+            chase.pending_round_amount(
+                chase.State(bet_topicids=[(7, "大"), (7, "小")]), cfg, 7
+            ),
+            0,
+        )
+        self.assertEqual(
+            chase.pending_round_amount(chase.State(), make_cfg(mode="chase", amount=100000), 7),
+            100000,
+        )
+
+    def test_combo_round_budget_blocks_before_overshooting_cap(self):
+        # 起点 900 + 整轮 200 > 1000 → 整轮预算检查就该拦下（只算本注 100 的旧实现会放到 1100）
+        state = chase.State(total_staked=900)
+        cfg = make_cfg(mode="combo", combo_amount=100, max_total_stake=1000)
+        pending = chase.pending_round_amount(state, cfg, 42)
+        self.assertEqual(pending, 200)
+        self.assertIsNotNone(chase.cap_blocker(state, cfg, pending))
+
     def test_cap_blocker_combo_uses_combo_amount(self):
         # total_staked=950, combo_amount=100, cap=1000 => 950+100 > 1000? 1050 > 1000 -> blocked
         state = chase.State(total_staked=950)

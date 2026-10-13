@@ -86,6 +86,10 @@ REJECTION_TEXT_RE = re.compile(
     r"<td\b[^>]*class=\"[^\"]*text[^\"]*\"[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL
 )
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+# 200 里只有这些「论坛明确告诉你这一注没被收下」的文案才允许重试。
+# 认不出的 200 一律按结果不明停手：200 也可能出现在「帖子其实已经发出、
+# 只是没重定向」的告示页上，那时重试就是真的重复下注（护栏只按成功计数记账，会漏记）。
+REFUSAL_TEXT_RE = re.compile(r"请不要连续发帖|不能连续发帖|发帖间隔")
 
 LIST_ROUND_MARKER = "本轮开奖时间"
 
@@ -407,7 +411,12 @@ class ForumClient:
         if response.status in SUCCESS_STATUSES:
             return
         if response.status == REJECTED_STATUS:
-            raise BetRejected(extract_rejection_reason(response.body))
+            reason = extract_rejection_reason(response.body)
+            if not is_retryable_refusal(response.body):
+                raise BetUncertain(
+                    f"下注返回 200 但没有可识别的拒绝文案，不确定论坛是否已收单: {reason}"
+                )
+            raise BetRejected(reason)
         raise BetUncertain(
             f"下注返回了无法判定的状态 {response.status}，不确定论坛是否已收单"
         )
@@ -448,6 +457,14 @@ def extract_rejection_reason(html: str) -> str:
         if text:
             return text[:120]
     return "论坛拒绝了下注，但没有给出可读原因"
+
+
+def is_retryable_refusal(html: str) -> bool:
+    """200 页面是否载有「这一注没被收下」的已知拒绝文案。
+
+    只有认得出来的拒绝才可重试；认不出来的一律按结果不明停手，避免重复下注。
+    """
+    return bool(REFUSAL_TEXT_RE.search(html or ""))
 
 
 def place_combo_bet_until_accepted(
@@ -582,6 +599,7 @@ class State:
     armed: bool = False
     # combo 模式扩展:每个元素是 (topicid, type) 元组;chase 模式下 type 固定为 cfg.target_type
     bet_topicids: List[Tuple[int, str]] = field(default_factory=list)
+    # 本次运行累计投入;启动时由 reset_run_state 清零 —— 状态文件里那份只是上次运行的记录,不参与护栏
     total_staked: int = 0
     consecutive_bets: int = 0
 
@@ -677,31 +695,42 @@ def save_state(path: str, state: State) -> None:
 
 
 def reset_run_state(state: State) -> bool:
-    """每次启动重置 armed 与连续下注计数,让阈值重新评估。
+    """每次启动重置「本次运行」的量:armed、连续下注计数与累计投入。
 
-    total_staked / bet_topicids / last_seen_topicid 保留:
-    - total_staked 是跨重启的累计护栏,语义不该因重启清零
-    - bet_topicids / last_seen_topicid 是去重记录,保留能避免重启后重复下注
+    total_staked 计的是本次运行的投入上限(max_total_stake),语义是「本次运行」——
+    上一轮运行留下的值不清零,会让新进程一注未下就撞上限。
+    bet_topicids / last_seen_topicid 保留:它们是去重记录,保留能避免重启后重复下注。
     """
-    changed = state.armed or state.consecutive_bets > 0
+    changed = state.armed or state.consecutive_bets > 0 or state.total_staked > 0
     state.armed = False
     state.consecutive_bets = 0
+    state.total_staked = 0
     return changed
 
 
-def cap_blocker(state: State, cfg: Config, per_bet_amount: int) -> Optional[str]:
-    """按 cfg.mode 选用对应单注金额的护栏检查。
+def cap_blocker(state: State, cfg: Config, pending_amount: int) -> Optional[str]:
+    """护栏检查:本次将要下出去的 pending_amount 会不会顶破上限。
 
-    chase 模式 per_bet_amount=cfg.amount;combo 模式 per_bet_amount=cfg.combo_amount。
+    pending_amount 是「接下来这一次下注动作会花掉的钱」——
+    chase 模式是一注的 cfg.amount;combo 模式是一整轮剩余类型的合计
+    (见 pending_round_amount),否则整轮的第二注起就绕过了预算检查。
     """
-    if cfg.max_total_stake is not None and state.total_staked + per_bet_amount > cfg.max_total_stake:
+    if cfg.max_total_stake is not None and state.total_staked + pending_amount > cfg.max_total_stake:
         return (
-            f"累计投入 {state.total_staked} + 本注 {per_bet_amount} 会超过总投入上限 "
+            f"累计投入 {state.total_staked} + 本次待下 {pending_amount} 会超过总投入上限 "
             f"{cfg.max_total_stake}"
         )
     if cfg.max_consecutive_bets is not None and state.consecutive_bets + 1 > cfg.max_consecutive_bets:
         return f"连续下注已达上限 {cfg.max_consecutive_bets}"
     return None
+
+
+def pending_round_amount(state: State, cfg: Config, topicid: int) -> int:
+    """该轮还没下的注一共会花掉多少:chase 是一注,combo 是剩余类型的合计。"""
+    if cfg.mode != "combo":
+        return cfg.amount
+    remaining = sum(1 for t in cfg.combo_types if not state_bet_type(state, topicid, t))
+    return remaining * cfg.combo_amount
 
 
 # -------------------------------------------------------------------- 策略
@@ -985,7 +1014,6 @@ def run_loop(cfg: Config, client: ForumClient, state: State, stop: StopFlag, sta
         announced: set = set()
     else:
         announced = set()
-    per_bet_amount = cfg.combo_amount if cfg.mode == "combo" else cfg.amount
     while not stop.requested:
         try:
             rounds = collect_rounds(client, cfg)
@@ -1005,7 +1033,9 @@ def run_loop(cfg: Config, client: ForumClient, state: State, stop: StopFlag, sta
         decision = decide(rounds, cfg, state)
 
         if decision.bet_topicid is not None:
-            blocker = cap_blocker(state, cfg, per_bet_amount)
+            blocker = cap_blocker(
+                state, cfg, pending_round_amount(state, cfg, decision.bet_topicid)
+            )
             if blocker:
                 save_state(state_path, state)
                 LOG.error("触发保险上限，停止投注并退出: %s", blocker)
@@ -1139,7 +1169,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if note:
         LOG.warning("%s", note)
     if reset_run_state(state):
-        LOG.info("本次启动重置追号态：armed 与连续下注计数清零,阈值将重新评估")
+        LOG.info("本次启动重置追号态：armed、连续下注计数与累计投入清零,阈值与投入上限重新评估")
 
     client = ForumClient(UrllibTransport(cfg.cookie, cfg.user_agent))
 
