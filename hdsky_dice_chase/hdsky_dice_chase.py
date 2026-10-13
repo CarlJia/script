@@ -55,10 +55,13 @@ RETRY_FIRST_DELAY_S = 3.0
 RETRY_DELAY_S = 10.0
 RETRY_MAX_ATTEMPTS = 12
 # combo 模式第二注及之后的重试节奏（与 user.js 一键大小按钮 SECOND_BET_* 一致）
+# 实测论坛对同一用户两次发帖的最小间隔在 4–12 秒之间（~4s 必被拒,12s 已能落单）:
+# 第二注的第一次尝试（3s）多半被拒,靠第二次尝试（再等 10s）落单。
 COMBO_FIRST_DELAY_S = 3.0
 COMBO_RETRY_DELAY_S = 10.0
 COMBO_MAX_ATTEMPTS = 12
-# 论坛限制同一用户连续发帖，两次 POST 之间的下限
+# 客户端自己设的两次 POST 之间的下限。论坛实际下限更高（见上面 COMBO_* 的实测），
+# 单注路径靠它防连击；combo 第二注的间隔由 COMBO_* 的重试节奏兜住。
 MIN_POST_INTERVAL_S = 3.0
 
 DEFAULT_POLL_INTERVAL_S = 15.0
@@ -86,9 +89,13 @@ REJECTION_TEXT_RE = re.compile(
     r"<td\b[^>]*class=\"[^\"]*text[^\"]*\"[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL
 )
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-# 200 里只有这些「论坛明确告诉你这一注没被收下」的文案才允许重试（限流拒绝页）。
-# 认不出的 200 视为论坛没收下这一注（见 BetNotAccepted）——不重试，也不按结果不明停手。
+# 200 里命中这些「论坛明确告诉你这一注没被收下」的文案时，按限流拒绝重试。
+# 只是乐观识别：2026-10-13 现场那次「间隔不足」的拒绝页一个关键词都没命中（详见
+# BetNotAccepted），所以 combo 第二注及之后不再依赖它 —— 200 一律按没收下处理。
 REFUSAL_TEXT_RE = re.compile(r"请不要连续发帖|不能连续发帖|发帖间隔")
+
+# 认不出的下注响应在 DEBUG 日志里留多少字符的正文（现场只剩导航文案，事后无从判断原因）
+BODY_SNIPPET_LEN = 300
 
 LIST_ROUND_MARKER = "本轮开奖时间"
 
@@ -125,9 +132,11 @@ class BetUncertain(DiceChaseError):
 class BetNotAccepted(DiceChaseError):
     """论坛没有收下这一注，且原因不是它认得出来的限流拒绝页。
 
-    现场实证：第一注落下后该轮不再收帖时，论坛对下一注回的是 200 + 首页正文（不是拒绝页）。
-    这类「没收下」是正常状态（该轮已锁定/已满/已开奖），既不该按限流节奏重试，也不该
-    当结果不明把进程打停 —— 放弃该轮，等下一轮轮询重新评估即可。
+    现场实证（2026-10-13）：combo 第二注在第一注落下约 4 秒后发出时，论坛回 200 + 拒绝页；
+    那页正文与 extract_rejection_reason / REFUSAL_TEXT_RE 认得出来的形态都不一致（只抓到页头
+    导航），而同一用户隔 12–18 秒再发就能落单 —— 是「两次发帖间隔不足」的瞬时拒绝，重试即可。
+    因此 combo 第二注及之后会先按节奏重试（见 place_combo_bet_until_accepted）；重试上限内
+    仍没收下才当作「这轮不收了」，放弃该轮、等下一轮轮询重新评估，不必把进程打停。
     """
 
     def __init__(self, reason: str):
@@ -426,6 +435,12 @@ class ForumClient:
         if response.status == REJECTED_STATUS:
             reason = extract_rejection_reason(response.body)
             if not is_retryable_refusal(response.body):
+                # reason 可能只是页头导航（现场 2026-10-13 就是），留一条正文痕迹供下次定位
+                LOG.debug(
+                    "认不出的下注响应（200）正文前 %s 字符: %s",
+                    BODY_SNIPPET_LEN,
+                    body_snippet(response.body),
+                )
                 raise BetNotAccepted(reason)
             raise BetRejected(reason)
         raise BetUncertain(
@@ -471,8 +486,19 @@ def extract_rejection_reason(html: str) -> str:
 
 
 def is_retryable_refusal(html: str) -> bool:
-    """200 页面是否载有「这一注没被收下」的已知限流拒绝文案（只有这类才可重试）。"""
+    """200 页面是否载有「这一注没被收下」的已知限流拒绝文案。
+
+    只用于区分拒绝原因（要不要按限流节奏重试）；200 本身一律视为「没收下」。
+    """
     return bool(REFUSAL_TEXT_RE.search(html or ""))
+
+
+def body_snippet(html: str, limit: int = BODY_SNIPPET_LEN) -> str:
+    """把响应正文压成单行片段供日志使用。
+
+    响应正文里没有请求头，不会带出 Cookie（见 R20）。
+    """
+    return re.sub(r"\s+", " ", html or "").strip()[:limit]
 
 
 def place_combo_bet_until_accepted(
@@ -481,21 +507,42 @@ def place_combo_bet_until_accepted(
     bet_type: str,
     amount: int,
     on_attempt: Optional[Callable[[int], None]] = None,
+    stop: Optional["StopFlag"] = None,
 ) -> None:
     """combo 模式第二注及之后的重试节奏（与 user.js 一键大小按钮 SECOND_BET_* 一致）。
 
-    只对论坛明确渲染的拒绝页重试;BetUncertain / BetNotAccepted / 网络异常立即上抛。
+    论坛对「同一用户两次发帖间隔不足」回 200 + 拒绝页，而该页文案不保证可识别：现场
+    （2026-10-13 18:21）认不出，于是第二注一次就被放弃、整轮再没落单。所以这里按 user.js
+    的做法，200 一律当作「论坛没收下这一注」按节奏重试，等间隔够了再发。
+    BetUncertain / 网络异常仍然立即上抛。
+
+    重试窗口最长约 113 秒，所以等了 stop 就用可中断睡眠：收到 SIGINT/SIGTERM 立即停手
+    （StopRun(0)），不在窗口里继续真下注。
+
+    上限内仍没收下 → 一律按 BetNotAccepted 上抛（两种 200 都表示这一注没收下），由调用方
+    放弃该轮并继续轮询；处置不随「最后一次恰好回哪种 200」翻转。
     """
+    last_error: Optional[DiceChaseError] = None
     for attempt in range(1, COMBO_MAX_ATTEMPTS + 1):
         if on_attempt:
             on_attempt(attempt)
-        client._sleep(COMBO_FIRST_DELAY_S if attempt == 1 else COMBO_RETRY_DELAY_S)
+        delay = COMBO_FIRST_DELAY_S if attempt == 1 else COMBO_RETRY_DELAY_S
+        if stop is None:
+            client._sleep(delay)
+        else:
+            sleep_interruptibly(delay, stop)
+            if stop.requested:
+                LOG.info("重试等待期间收到停止请求，放弃本轮剩余类型")
+                raise StopRun(0)
         try:
             client.place_bet(topicid, bet_type, amount)
             return
-        except BetRejected:
-            if attempt >= COMBO_MAX_ATTEMPTS:
-                raise
+        except (BetRejected, BetNotAccepted) as exc:
+            last_error = exc
+    raise BetNotAccepted(
+        f"重试 {COMBO_MAX_ATTEMPTS} 次后论坛仍未收下这一注: "
+        f"{getattr(last_error, 'reason', '') or '未给出原因'}"
+    )
 
 
 # ------------------------------------------------------------------ 列表页解析
@@ -946,12 +993,17 @@ def place_combo_for_round(
     state_path: str,
     topicid: int,
     announced: set,
+    stop: Optional["StopFlag"] = None,
 ) -> None:
     """combo 模式下对该 topicid 顺序下 cfg.combo_types 的每个类型。
 
     第一注按 chase 既定重试节奏(RETRY_*);第二注及之后按 user.js 一键大小节奏(COMBO_*)。
     同一 (topicid, type) 已记录则跳过。全部 combo_types 成功完成后 consecutive_bets + 1。
-    失败(BetUncertain / BetNotAccepted 或第二注及之后达到重试上限仍被拒)→ save_state + StopRun(4 或 5)。
+
+    每落一注立即 save_state：第二注的重试窗口最长约 113 秒，状态要在这段窗口开始前就落盘，
+    否则进程被强杀后重启会读不到第一注、对这一轮重复下注（评审 #1）。
+    失败处置:BetUncertain → StopRun(4);认得出的拒绝页在重试上限后仍被拒 → StopRun(5);
+    认不出的 200（含第二注重试耗尽）→ 放弃本轮剩余类型、继续轮询。
     """
     assert cfg.mode == "combo", "place_combo_for_round 仅在 combo 模式调用"
 
@@ -989,7 +1041,7 @@ def place_combo_for_round(
                 )
             else:
                 place_combo_bet_until_accepted(
-                    client, topicid, btype, cfg.combo_amount, on_attempt=on_attempt
+                    client, topicid, btype, cfg.combo_amount, on_attempt=on_attempt, stop=stop
                 )
         except (BetUncertain, DiceNetworkError) as exc:
             save_state(state_path, state)
@@ -1023,6 +1075,8 @@ def place_combo_for_round(
         state.bet_topicids.append((topicid, btype))
         state.bet_topicids = state.bet_topicids[-MAX_REMEMBERED_BETS:]
         state.total_staked += cfg.combo_amount
+        # 每落一注就落盘：下一注的重试窗口里进程被强杀也不丢去重记录（评审 #1）
+        save_state(state_path, state)
         LOG.info(
             "[combo] 下注成功：%s %s @ topicid=%s（本次运行累计投入 %s）",
             btype,
@@ -1080,7 +1134,7 @@ def run_loop(cfg: Config, client: ForumClient, state: State, stop: StopFlag, sta
                 return 3
             if cfg.mode == "combo":
                 place_combo_for_round(
-                    cfg, client, state, state_path, decision.bet_topicid, announced
+                    cfg, client, state, state_path, decision.bet_topicid, announced, stop
                 )
             else:
                 place_bet_for_round(

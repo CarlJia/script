@@ -39,8 +39,9 @@ def row_html(topicid, result=None, locked=False, time_text="2026-10-08 15:00"):
     )
 
 
-# 现场样本（2026-10-13 14:11，topicid=78016）：该轮刚不再收帖时，论坛对下注 POST
-# 回的是 200 + 首页正文（导航单元格），既没有 302 重定向，也没有任何拒绝文案。
+# 现场样本（2026-10-13 14:11，topicid=78016）：论坛对「间隔不足的第二注」回 200 + 拒绝页，
+# 正文里认不出任何拒绝文案（extract_rejection_reason 还会先抓到页头导航单元格）。
+# 它表示「没收下」而非「已收单」：同一用户隔 12–18 秒再发就能落单（见 ComboExecutionTests）。
 INDEX_PAGE_200 = (
     '<html><head><title>HDSky :: 首页</title></head><body><table>'
     '<tr><td class="text">&nbsp;首&nbsp;&nbsp;页&nbsp; &nbsp;论&nbsp;&nbsp;坛&nbsp; '
@@ -345,14 +346,35 @@ class ClientTests(unittest.TestCase):
         self.assertIn("请不要连续发帖", ctx.exception.reason)
 
     def test_bet_200_without_recognized_refusal_is_not_retried(self):
-        # 现场（2026-10-13 14:11）：第一注落下后该轮不再收帖，论坛对第二注回 200 + 首页正文
-        # （不是带文案的拒绝页）。这类 200 既不按限流拒绝重试 12 次，也不该把进程打停。
+        # 认不出文案的 200 = 论坛没收下这一注（被收下一定是 302）。单注入口只判定「没收下」，
+        # combo 第二注及之后的「按节奏重试」在 place_combo_bet_until_accepted（见 ComboExecutionTests）。
+        # 现场（2026-10-13 18:21）那类 200 的正文不是带文案的拒绝页，extract_rejection_reason
+        # 还会先抓到页头导航单元格（所以 reason 里是导航文字，不是拒绝原因）。
         transport = FakeTransport(post_results=[chase.HttpResponse(200, INDEX_PAGE_200)])
         client, _ = fake_client(transport)
         with self.assertRaises(chase.BetNotAccepted) as ctx:
             client.place_bet_until_accepted(1005, "小", 100)
         self.assertEqual(len(transport.post_calls), 1)
         self.assertIn("EMBY订阅", ctx.exception.reason)
+
+    def test_unrecognized_200_body_is_logged_at_debug(self):
+        """认不出的 200 要留一条正文痕迹：现场只有导航文案，事后无从判断论坛到底为什么没收下。"""
+        transport = FakeTransport(post_results=[chase.HttpResponse(200, INDEX_PAGE_200)])
+        client, _ = fake_client(transport)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        chase.LOG.addHandler(handler)
+        previous_level = chase.LOG.level
+        chase.LOG.setLevel(logging.DEBUG)
+        self.addCleanup(chase.LOG.removeHandler, handler)
+        self.addCleanup(chase.LOG.setLevel, previous_level)
+        with self.assertRaises(chase.BetNotAccepted):
+            client.place_bet_until_accepted(1005, "小", 100)
+        logged = stream.getvalue()
+        # 只断言「认不出的 200 正文被留痕」这件事本身。凭据不入日志由 test_cookie_never_reaches_logs
+        # 负责 —— 本用例的 client 根本不持有 Cookie，在这里断言不含 c_secure_pass 只会恒真（评审 #5）。
+        self.assertIn("HDSky :: 首页", logged)
+        self.assertIn("EMBY订阅", logged)
 
     def test_bet_unknown_status_is_uncertain(self):
         transport = FakeTransport(post_results=[chase.HttpResponse(403, "forbidden")])
@@ -724,7 +746,14 @@ class LoopTests(unittest.TestCase):
     避免真等；循环的终止由 transport 在指定次数后置停机标志来触发。
     """
 
-    def _drive(self, tmp, *, dry_run, stop_after_gets, stop_on_post=False, reset_state=False, html=None, **cfg_over):
+    def _drive(self, tmp, *, dry_run, stop_after_gets, stop_on_post=False, stop_after_posts=None,
+               reset_state=False, html=None, **cfg_over):
+        """跑一次 run_loop。
+
+        stop_on_post 在第一次 POST 后置停机标志（chase 一轮一注，够用）；
+        combo 一轮两注，要用 stop_after_posts=N 在第 N 次 POST 后才停，
+        否则第二次下注的重试窗口会立刻看到停机标志并抛 StopRun(0)。
+        """
         defaults = dict(threshold=1, amount=100)
         defaults.update(cfg_over)
         cfg = make_cfg(
@@ -749,7 +778,7 @@ class LoopTests(unittest.TestCase):
 
             def post(self, url, form):
                 self.posts += 1
-                if stop_on_post:
+                if stop_on_post or (stop_after_posts is not None and self.posts >= stop_after_posts):
                     stop.requested = True
                 return chase.HttpResponse(302, "")
 
@@ -851,10 +880,11 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(state.total_staked, 0)
 
     def test_loop_skips_half_bet_round_after_it_becomes_locked(self):
-        """回归（2026-10-13 14:11）：第一注落下后该轮不再收帖 → 第二注被「200 + 首页」挡下。
+        """回归（2026-10-13）：第一注落下后该轮不再收帖 → 第二注重试到上限仍被「200」挡下。
 
-        期望：进程不中断；下一轮轮询看到该轮已锁定就跳过它，并在新的开放轮上把两注下完。
-        锁定-跳过实际发生在第三轮轮询（第二轮轮询里决定先挑更新的开放轮 102）。
+        期望：进程不中断；该轮记入 refused_rounds；下一轮轮询看到该轮已锁定就跳过它，
+        并在新的开放轮上把两注下完。锁定-跳过实际发生在第三轮轮询（第二轮轮询里决定先挑
+        更新的开放轮 102）。
         """
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(
@@ -882,8 +912,8 @@ class LoopTests(unittest.TestCase):
 
                 def post(self, url, form):
                     self.posts.append(form)
-                    # 101 的第一注成功、第二注被挡；102 两注都成功
-                    if len(self.posts) == 2:
+                    # 101 的第一注成功；101 不再收帖，第二注每次都被挡；102 两注都成功
+                    if form["id"] == "101" and form["body"] == "小 100":
                         return chase.HttpResponse(200, INDEX_PAGE_200)
                     return chase.HttpResponse(302, "")
 
@@ -897,13 +927,14 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(state.bet_topicids, [(101, "大"), (102, "大"), (102, "小")])
         self.assertEqual(state.total_staked, 300)
-        self.assertEqual(len(transport.posts), 4)
+        # 101: 大 1 次 + 小 试满上限;102: 大 + 小 各 1 次
+        self.assertEqual(len(transport.posts), 1 + chase.COMBO_MAX_ATTEMPTS + 2)
         self.assertIn(101, state.refused_rounds)
 
     def test_loop_does_not_repost_a_refused_round_that_stays_open(self):
         """评审 #1 的回归：被拒的轮若一直保持开放，也不能每个轮询周期重发同一注。
 
-        第 1 轮轮询：101 的第一注成功、第二注被「200 + 首页」挡下（写入 refused_rounds）。
+        第 1 轮轮询：101 的第一注成功、第二注重试到上限都被「200」挡下（写入 refused_rounds）。
         之后 101 仍然开放（未锁定、未开奖）——旧行为会每次轮询重发 (101, "小")；现在应跳过 101,
         转去下新的开放轮 102。
         """
@@ -933,8 +964,8 @@ class LoopTests(unittest.TestCase):
 
                 def post(self, url, form):
                     self.posts.append(form)
-                    # 101 的第一注成功、第二注被挡；102 两注都成功
-                    if len(self.posts) == 2:
+                    # 101 的第一注成功；101 不再收帖，第二注每次都被挡；102 两注都成功
+                    if form["id"] == "101" and form["body"] == "小 100":
                         return chase.HttpResponse(200, INDEX_PAGE_200)
                     return chase.HttpResponse(302, "")
 
@@ -946,12 +977,15 @@ class LoopTests(unittest.TestCase):
                 code = chase.run_loop(cfg, client, state, stop, cfg.state_file)
 
         self.assertEqual(code, 0)
-        # 101 只被尝试过一次（第一注成功 + 第二注被拒），没有在第 2 轮轮询里重发
+        # 101 只被尝试过一轮（第一注成功 + 第二注试满重试上限），没有在第 2 轮轮询里重发
         self.assertEqual(state.bet_topicids, [(101, "大"), (102, "大"), (102, "小")])
         self.assertEqual(state.total_staked, 300)
-        self.assertEqual(len(transport.posts), 4)
+        self.assertEqual(len(transport.posts), 1 + chase.COMBO_MAX_ATTEMPTS + 2)
         self.assertIn(101, state.refused_rounds)
-        self.assertEqual(transport.posts.count({"id": "101", "type": "reply", "body": "小 100"}), 1)
+        self.assertEqual(
+            transport.posts.count({"id": "101", "type": "reply", "body": "小 100"}),
+            chase.COMBO_MAX_ATTEMPTS,
+        )
 
     def test_second_start_ignores_previous_runs_total_staked(self):
         """回归：上次运行落盘的 total_staked=1100 不该让本次启动一注未下就触发保险上限。"""
@@ -970,7 +1004,7 @@ class LoopTests(unittest.TestCase):
                 tmp,
                 dry_run=False,
                 stop_after_gets=3,
-                stop_on_post=True,
+                stop_after_posts=2,  # combo 一轮两注：等都下完再停，否则第二注立刻被停机标志打断
                 reset_state=True,
                 mode="combo",
                 combo_amount=100,
@@ -1266,7 +1300,9 @@ class ComboExecutionTests(unittest.TestCase):
         self.assertEqual(state.total_staked, 200)
         self.assertEqual(state.consecutive_bets, 1)
 
-    def test_combo_second_bet_rejected_uses_combo_retry_rhythm(self):
+    def test_combo_second_bet_recognized_refusals_exhausted_abandons_round(self):
+        """回归（评审 #4）：小 连吃 12 个「认得出文案的拒绝页」时处置与认不出的 200 一致 ——
+        放弃该轮并继续跑，而不是因为最后一次恰好是 BetRejected 就把整个进程停掉。"""
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(
                 mode="combo",
@@ -1279,18 +1315,108 @@ class ComboExecutionTests(unittest.TestCase):
                 post_results=[
                     chase.HttpResponse(302, ""),  # 大 成功
                     *[chase.HttpResponse(200, '<td class="text">请不要连续发帖</td>')]
-                    * chase.COMBO_MAX_ATTEMPTS,  # 小 12 次拒绝
+                    * chase.COMBO_MAX_ATTEMPTS,  # 小 12 次可识别拒绝
                 ]
             )
             client, _ = fake_client(transport)
             state = chase.State()
-            with self.assertRaises(chase.StopRun) as ctx_exc:
-                chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
-        self.assertEqual(ctx_exc.exception.code, 5)
-        # 大已记下，小未记下，consecutive_bets 不递增
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())  # 不抛异常
+        self.assertEqual(len(transport.post_calls), 1 + chase.COMBO_MAX_ATTEMPTS)
+        # 大已记下，小未记下，consecutive_bets 不递增，该轮记入 refused_rounds 后继续跑
         self.assertEqual(state.bet_topicids, [(1005, "大")])
         self.assertEqual(state.total_staked, 100)
         self.assertEqual(state.consecutive_bets, 0)
+        self.assertIn(1005, state.refused_rounds)
+
+    def test_combo_exhausted_retries_ignore_last_attempt_exception_type(self):
+        """回归（评审 #4）：末次恰好是可识别拒绝页时结局不变 —— 与认不出的 200 交替出现也一样。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[
+                    chase.HttpResponse(302, ""),  # 大 成功
+                    *[chase.HttpResponse(200, INDEX_PAGE_200)] * (chase.COMBO_MAX_ATTEMPTS - 1),
+                    chase.HttpResponse(200, '<td class="text">请不要连续发帖</td>'),  # 末次:可识别
+                ]
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())  # 不抛异常
+        self.assertEqual(len(transport.post_calls), 1 + chase.COMBO_MAX_ATTEMPTS)
+        self.assertEqual(state.bet_topicids, [(1005, "大")])
+        self.assertIn(1005, state.refused_rounds)
+
+    def test_combo_first_bet_is_persisted_before_the_second_bet_runs(self):
+        """回归（评审 #1）：第一注落单后立刻落盘 —— 第二注还在重试窗口里时，磁盘上就得有 (topicid, 大)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            on_disk = []
+
+            class Transport:
+                def post(self, url, form):
+                    if form["body"] == "小 100":
+                        # 第二注每次 POST 之前把磁盘状态读回来（等价于此刻进程被强杀后重启）
+                        disk, _ = chase.load_state(cfg.state_file)
+                        on_disk.append(list(disk.bet_topicids))
+                        return chase.HttpResponse(200, INDEX_PAGE_200)
+                    return chase.HttpResponse(302, "")
+
+                def get(self, url):  # pragma: no cover - 本用例不需要 GET
+                    raise AssertionError("本用例不该发 GET")
+
+            client = chase.ForumClient(Transport(), sleep=lambda _s: None, clock=lambda: 0.0)
+            chase.place_combo_for_round(cfg, client, chase.State(), cfg.state_file, 1005, set())
+
+        self.assertTrue(on_disk, "第二注没有发出")
+        self.assertEqual(on_disk[0], [(1005, "大")])  # 小 首次尝试之前,大 已在盘上
+        self.assertEqual(on_disk[-1], [(1005, "大")])
+
+    def test_combo_retry_stops_promptly_on_stop_signal(self):
+        """回归（评审 #3）：重试窗口内收到停止请求就立即停手,不再往下注。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            stop = chase.StopFlag()
+
+            class Transport:
+                def __init__(self):
+                    self.posts = []
+
+                def post(self, url, form):
+                    self.posts.append(form)
+                    if form["body"] == "小 100":
+                        stop.requested = True  # 小 被拒的同时用户按了 Ctrl-C
+                        return chase.HttpResponse(200, INDEX_PAGE_200)
+                    return chase.HttpResponse(302, "")
+
+                def get(self, url):  # pragma: no cover - 本用例不需要 GET
+                    raise AssertionError("本用例不该发 GET")
+
+            transport = Transport()
+            client = chase.ForumClient(transport, sleep=lambda _s: None, clock=lambda: 0.0)
+            with self.assertRaises(chase.StopRun) as ctx:
+                chase.place_combo_for_round(
+                    cfg, client, chase.State(), cfg.state_file, 1005, set(), stop
+                )
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(len(transport.posts), 2)  # 大 一次 + 小 一次,没有继续重试
 
     def test_combo_first_bet_rejected_twelve_times_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1314,8 +1440,9 @@ class ComboExecutionTests(unittest.TestCase):
         self.assertEqual(ctx_exc.exception.code, 5)
         self.assertEqual(state.bet_topicids, [])
 
-    def test_combo_second_bet_refused_on_locked_round_skips_without_stopping(self):
-        """回归（2026-10-13 14:11）：小 拿到「200 + 首页」时放弃该轮剩余类型并继续跑，不打停进程。"""
+    def test_combo_second_bet_retries_unrecognized_200_then_records_both(self):
+        """回归（2026-10-13 18:21 现场）：论坛对 ~4 秒后的第二注回 200（拒绝页文案认不出），
+        重试到间隔够了才被收下（302）—— 两注都要记账，不能放弃该轮。"""
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(
                 mode="combo",
@@ -1326,9 +1453,59 @@ class ComboExecutionTests(unittest.TestCase):
             )
             transport = FakeTransport(
                 post_results=[
-                    chase.HttpResponse(302, ""),  # 大 成功
-                    chase.HttpResponse(200, INDEX_PAGE_200),  # 小 被论坛挡下（该轮已不再收帖）
+                    chase.HttpResponse(302, ""),  # 大 被收下
+                    chase.HttpResponse(200, INDEX_PAGE_200),  # 小 第 1 次：间隔不够，没收下
+                    chase.HttpResponse(302, ""),  # 小 第 2 次：被收下
                 ]
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+        self.assertEqual(len(transport.post_calls), 3)
+        self.assertEqual(state.bet_topicids, [(1005, "大"), (1005, "小")])
+        self.assertEqual(state.total_staked, 200)
+        self.assertEqual(state.consecutive_bets, 1)
+        self.assertEqual(state.refused_rounds, [])
+
+    def test_combo_second_bet_retry_waits_combo_retry_delay(self):
+        """重试的等待必须够长：大 等 RETRY_FIRST_DELAY_S，小 首次等 COMBO_FIRST_DELAY_S，
+        重试再等 COMBO_RETRY_DELAY_S —— 与 user.js 一键大小的节奏一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[
+                    chase.HttpResponse(302, ""),
+                    chase.HttpResponse(200, INDEX_PAGE_200),
+                    chase.HttpResponse(302, ""),
+                ]
+            )
+            client, clock = fake_client(transport)
+            chase.place_combo_for_round(cfg, client, chase.State(), cfg.state_file, 1005, set())
+        self.assertEqual(
+            clock["now"],
+            chase.RETRY_FIRST_DELAY_S + chase.COMBO_FIRST_DELAY_S + chase.COMBO_RETRY_DELAY_S,
+        )
+
+    def test_combo_second_bet_gives_up_round_after_retries_exhausted(self):
+        """回归（2026-10-13 18:21）：小 一直拿 200 时按 COMBO_* 节奏重试到上限才放弃本轮剩余类型，
+        进程继续跑（不打停），该轮记入 refused_rounds、下一轮轮询不再尝试。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(
+                mode="combo",
+                combo_amount=100,
+                combo_types=["大", "小"],
+                dry_run=False,
+                state_file=os.path.join(tmp, "state.json"),
+            )
+            transport = FakeTransport(
+                post_results=[chase.HttpResponse(302, "")]  # 大 成功
+                + [chase.HttpResponse(200, INDEX_PAGE_200)] * chase.COMBO_MAX_ATTEMPTS
             )
             client, _ = fake_client(transport)
             state = chase.State()
@@ -1343,7 +1520,7 @@ class ComboExecutionTests(unittest.TestCase):
             chase.place_combo_for_round(cfg, client, state, cfg.state_file, 78016, set())  # 不抛异常
             saved, _ = chase.load_state(cfg.state_file)
 
-        self.assertEqual(len(transport.post_calls), 2)  # 没有按 3s/10s 节奏重试 12 次
+        self.assertEqual(len(transport.post_calls), 1 + chase.COMBO_MAX_ATTEMPTS)
         self.assertEqual(state.bet_topicids, [(78016, "大")])
         self.assertEqual(state.total_staked, 100)
         self.assertEqual(state.consecutive_bets, 0)
