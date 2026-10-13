@@ -86,9 +86,8 @@ REJECTION_TEXT_RE = re.compile(
     r"<td\b[^>]*class=\"[^\"]*text[^\"]*\"[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL
 )
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-# 200 里只有这些「论坛明确告诉你这一注没被收下」的文案才允许重试。
-# 认不出的 200 一律按结果不明停手：200 也可能出现在「帖子其实已经发出、
-# 只是没重定向」的告示页上，那时重试就是真的重复下注（护栏只按成功计数记账，会漏记）。
+# 200 里只有这些「论坛明确告诉你这一注没被收下」的文案才允许重试（限流拒绝页）。
+# 认不出的 200 视为论坛没收下这一注（见 BetNotAccepted）——不重试，也不按结果不明停手。
 REFUSAL_TEXT_RE = re.compile(r"请不要连续发帖|不能连续发帖|发帖间隔")
 
 LIST_ROUND_MARKER = "本轮开奖时间"
@@ -121,6 +120,19 @@ class BetRejected(DiceChaseError):
 
 class BetUncertain(DiceChaseError):
     """结果不明：请求可能已经到达论坛，重试会造成重复下注。"""
+
+
+class BetNotAccepted(DiceChaseError):
+    """论坛没有收下这一注，且原因不是它认得出来的限流拒绝页。
+
+    现场实证：第一注落下后该轮不再收帖时，论坛对下一注回的是 200 + 首页正文（不是拒绝页）。
+    这类「没收下」是正常状态（该轮已锁定/已满/已开奖），既不该按限流节奏重试，也不该
+    当结果不明把进程打停 —— 放弃该轮，等下一轮轮询重新评估即可。
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class LockHeld(DiceChaseError):
@@ -370,7 +382,7 @@ class UrllibTransport:
 
 
 class ForumClient:
-    """论坛读写：抓列表页、下注，并把成功 / 被拒 / 结果不明三态判干净。"""
+    """论坛读写：抓列表页、下注，并把「成功 / 限流拒绝 / 论坛没收下 / 结果不明」判干净。"""
 
     def __init__(
         self,
@@ -402,7 +414,8 @@ class ForumClient:
 
     # -- 写 ---------------------------------------------------------------
     def place_bet(self, topicid: int, bet_type: str, amount: int) -> None:
-        """下注一次。成功即返回，失败抛 BetRejected（可重试）或 BetUncertain（不可重试）。"""
+        """下注一次。成功即返回；失败抛 BetRejected（限流拒绝，可重试）、
+        BetNotAccepted（论坛没收下，不重试也不停手）或 BetUncertain（结果不明）。"""
         self._respect_post_interval()
         form = {"id": str(topicid), "type": "reply", "body": f"{bet_type} {amount}"}
         response = self._transport.post(f"{BASE_URL}{POST_PATH}", form)
@@ -413,9 +426,7 @@ class ForumClient:
         if response.status == REJECTED_STATUS:
             reason = extract_rejection_reason(response.body)
             if not is_retryable_refusal(response.body):
-                raise BetUncertain(
-                    f"下注返回 200 但没有可识别的拒绝文案，不确定论坛是否已收单: {reason}"
-                )
+                raise BetNotAccepted(reason)
             raise BetRejected(reason)
         raise BetUncertain(
             f"下注返回了无法判定的状态 {response.status}，不确定论坛是否已收单"
@@ -460,10 +471,7 @@ def extract_rejection_reason(html: str) -> str:
 
 
 def is_retryable_refusal(html: str) -> bool:
-    """200 页面是否载有「这一注没被收下」的已知拒绝文案。
-
-    只有认得出来的拒绝才可重试；认不出来的一律按结果不明停手，避免重复下注。
-    """
+    """200 页面是否载有「这一注没被收下」的已知限流拒绝文案（只有这类才可重试）。"""
     return bool(REFUSAL_TEXT_RE.search(html or ""))
 
 
@@ -476,7 +484,7 @@ def place_combo_bet_until_accepted(
 ) -> None:
     """combo 模式第二注及之后的重试节奏（与 user.js 一键大小按钮 SECOND_BET_* 一致）。
 
-    只对论坛明确渲染的拒绝页重试;BetUncaught / 网络异常立即上抛。
+    只对论坛明确渲染的拒绝页重试;BetUncertain / BetNotAccepted / 网络异常立即上抛。
     """
     for attempt in range(1, COMBO_MAX_ATTEMPTS + 1):
         if on_attempt:
@@ -602,6 +610,9 @@ class State:
     # 本次运行累计投入;启动时由 reset_run_state 清零 —— 状态文件里那份只是上次运行的记录,不参与护栏
     total_staked: int = 0
     consecutive_bets: int = 0
+    # 本次运行被论坛以"200 + 首页"等方式挡下的轮:记下后该轮在本轮询里不再尝试
+    # (review #1 的决策：记拒后跳过本轮 —— 接受瞬时拒绝可能丢这一轮的代价,避免轮询重发)
+    refused_rounds: List[int] = field(default_factory=list)
 
 
 SAFE_STATE_NOTE = "状态文件缺失或损坏：以「不追号、不补单」的安全默认启动"
@@ -679,6 +690,7 @@ def load_state(path: str):
             bet_topicids=bet_topicids,
             total_staked=int(raw.get("total_staked") or 0),
             consecutive_bets=int(raw.get("consecutive_bets") or 0),
+            refused_rounds=[int(x) for x in (raw.get("refused_rounds") or [])],
         )
     except (TypeError, ValueError):
         return State(), SAFE_STATE_NOTE
@@ -756,7 +768,9 @@ def decide(rounds: Sequence[Round], cfg: Config, state: State) -> Decision:
     if cfg.mode == "combo":
         # combo 模式不依赖连旱 / armed;挑首个未完成 combo_types 覆盖的开放轮
         for round_ in rounds:
-            if state_round_complete(state, round_.topicid, cfg.combo_types) or not round_.open:
+            if (state_round_complete(state, round_.topicid, cfg.combo_types)
+                    or not round_.open
+                    or round_.topicid in state.refused_rounds):
                 continue
             decision.bet_topicid = round_.topicid
             return decision
@@ -768,7 +782,9 @@ def decide(rounds: Sequence[Round], cfg: Config, state: State) -> Decision:
         return decision
 
     for round_ in rounds:
-        if state_bet_type(state, round_.topicid, cfg.target_type) or not round_.open:
+        if (state_bet_type(state, round_.topicid, cfg.target_type)
+                or not round_.open
+                or round_.topicid in state.refused_rounds):
             continue
         decision.bet_topicid = round_.topicid
         return decision
@@ -898,6 +914,16 @@ def place_bet_for_round(
         save_state(state_path, state)
         LOG.error("论坛拒绝下注，重试 %s 次后仍失败: %s", RETRY_MAX_ATTEMPTS, exc.reason)
         raise StopRun(5) from exc
+    except BetNotAccepted as exc:
+        # 该轮已不再收帖（锁定/已满/已开奖）：本轮放弃并记到本轮询的 refused_rounds,
+        # 进程继续跑;若该轮之后仍开放,下一轮轮询直接跳过,不再重复下注
+        if topicid not in state.refused_rounds:
+            state.refused_rounds.append(topicid)
+        save_state(state_path, state)
+        LOG.warning(
+            "论坛没有收下这一注，本轮放弃（下一轮轮询会重新评估该轮）: %s", exc.reason
+        )
+        return
 
     state.bet_topicids.append((topicid, cfg.target_type))
     state.bet_topicids = state.bet_topicids[-MAX_REMEMBERED_BETS:]
@@ -925,7 +951,7 @@ def place_combo_for_round(
 
     第一注按 chase 既定重试节奏(RETRY_*);第二注及之后按 user.js 一键大小节奏(COMBO_*)。
     同一 (topicid, type) 已记录则跳过。全部 combo_types 成功完成后 consecutive_bets + 1。
-    失败(BetUncertain 或第二注及之后达到重试上限仍被拒)→ save_state + StopRun(4 或 5)。
+    失败(BetUncertain / BetNotAccepted 或第二注及之后达到重试上限仍被拒)→ save_state + StopRun(4 或 5)。
     """
     assert cfg.mode == "combo", "place_combo_for_round 仅在 combo 模式调用"
 
@@ -981,6 +1007,18 @@ def place_combo_for_round(
                 exc.reason,
             )
             raise StopRun(5) from exc
+        except BetNotAccepted as exc:
+            # 该轮已不再收帖（锁定/已满/已开奖）：放弃本轮剩余类型并记到本轮询的 refused_rounds,
+            # 进程继续跑;若该轮之后仍开放,下一轮轮询直接跳过,不再重复下注
+            if topicid not in state.refused_rounds:
+                state.refused_rounds.append(topicid)
+            save_state(state_path, state)
+            LOG.warning(
+                "[combo] 论坛没有收下这一注，放弃本轮剩余类型"
+                "（下一轮轮询会重新评估该轮）: %s",
+                exc.reason,
+            )
+            return
 
         state.bet_topicids.append((topicid, btype))
         state.bet_topicids = state.bet_topicids[-MAX_REMEMBERED_BETS:]
