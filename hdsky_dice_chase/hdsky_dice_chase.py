@@ -50,6 +50,8 @@ SUCCESS_STATUSES = (302, 303, 301, 307, 308)
 REJECTED_STATUS = 200
 
 REQUEST_TIMEOUT_S = 15.0
+# 启动校验（validate_session）的只读重试次数：见 fetch_list_page_with_retry 的说明
+SESSION_CHECK_MAX_ATTEMPTS = 3
 # 与 user.js 一致的重试节奏：首次 3s，其后每次 10s，上限 12 次
 RETRY_FIRST_DELAY_S = 3.0
 RETRY_DELAY_S = 10.0
@@ -420,6 +422,33 @@ class ForumClient:
         ):
             raise SessionExpired("列表页是登录页内容，会话已失效")
         return response.body
+
+    def fetch_list_page_with_retry(
+        self, page: int = 1, attempts: int = SESSION_CHECK_MAX_ATTEMPTS
+    ) -> str:
+        """只读列表页，传输层抖动时按 RETRY_* 节奏重试。
+
+        实测（2026-10-17，本机 Clash TUN 出口 → Cloudflare，见 validate_session）：同一个请求
+        约 1/3 会在 TLS 握手或读响应阶段卡死，且卡死的那次到 15s / 40s 都不会自愈 —— 只能换一条
+        连接重来。只读请求幂等，重试安全；SessionExpired 与其它异常一律立即上抛（重试无意义，
+        而且下注路径的失败处理不能被这里吞掉）。
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.fetch_list_page(page)
+            except DiceNetworkError as exc:
+                if attempt >= attempts:
+                    raise
+                delay = RETRY_FIRST_DELAY_S if attempt == 1 else RETRY_DELAY_S
+                LOG.warning(
+                    "读列表页失败（第 %s/%s 次），%.0f 秒后重试: %s",
+                    attempt,
+                    attempts,
+                    delay,
+                    exc,
+                )
+                self._sleep(delay)
+        raise AssertionError("unreachable: attempts >= 1")
 
     # -- 写 ---------------------------------------------------------------
     def place_bet(self, topicid: int, bet_type: str, amount: int) -> None:
@@ -1235,8 +1264,12 @@ def cli_overrides(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def validate_session(client: ForumClient) -> None:
-    """拉一次列表页确认会话可用；失效就退出，不进循环。"""
-    client.fetch_list_page(1)
+    """拉一次列表页确认会话可用；失效就退出，不进循环。
+
+    只读请求幂等：瞬时传输层抖动（本机实测约 1/3 概率，见 fetch_list_page_with_retry）
+    按 RETRY_* 节奏重试几次，别让一次抖动在启动这一步就把整个进程打掉。
+    """
+    client.fetch_list_page_with_retry(1)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

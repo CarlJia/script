@@ -738,6 +738,55 @@ class CollectRoundsTests(unittest.TestCase):
         self.assertEqual([x.topicid for x in rounds], [2, 1])
 
 
+# ------------------------------------------------------------- 启动校验重试
+class ValidateSessionRetryTests(unittest.TestCase):
+    """启动校验对网络层抖动要有界重试。
+
+    实测（2026-10-17，本机 Clash TUN 出口 → Cloudflare）：同一个列表页请求约 1/3 会在
+    TLS 握手或读响应阶段卡死，且卡死的那次到 15s / 40s 都不会恢复 —— 只能换一条连接重来。
+    只读请求幂等，重试安全；会话失效（SessionExpired）是 cookie 的问题，重试无用，必须立即上抛。
+    """
+
+    def test_retries_transient_network_failure_then_succeeds(self):
+        """回归：一次瞬时读失败就把启动打掉时（现场 2026-10-17 11:13:54）这条会失败。"""
+        page = page_html([row_html(2, "小")])
+        transport = FakeTransport(
+            get_results=[
+                chase.DiceNetworkError("The read operation timed out"),
+                chase.HttpResponse(200, page),
+            ]
+        )
+        client, clock = fake_client(transport)
+
+        chase.validate_session(client)
+
+        self.assertEqual(len(transport.get_urls), 2)
+        # 重试前按 RETRY_* 节奏等过一次，不是连着打
+        self.assertEqual(clock["now"], chase.RETRY_FIRST_DELAY_S)
+
+    def test_gives_up_after_bounded_attempts(self):
+        transport = FakeTransport(get_results=[chase.DiceNetworkError("boom")] * 3)
+        client, _ = fake_client(transport)
+
+        with self.assertRaises(chase.DiceNetworkError):
+            chase.validate_session(client)
+
+        self.assertEqual(len(transport.get_urls), 3)
+
+    def test_session_expired_is_not_retried(self):
+        """会话失效重试无意义：必须一次就上抛，否则启动会白等两轮。"""
+        transport = FakeTransport(
+            get_results=[chase.SessionExpired("列表页是登录页内容，会话已失效")]
+        )
+        client, clock = fake_client(transport)
+
+        with self.assertRaises(chase.SessionExpired):
+            chase.validate_session(client)
+
+        self.assertEqual(len(transport.get_urls), 1)
+        self.assertEqual(clock["now"], 0.0)
+
+
 # --------------------------------------------------------------- 主循环端到端
 class LoopTests(unittest.TestCase):
     """用真实 fixture 驱动整个 run_loop —— 对应 plan 的「集成（离线）」一行。
