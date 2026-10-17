@@ -60,6 +60,30 @@ def page_html(rows, total_pages=None):
     return f"<html><body><table>{''.join(rows)}</table>{pager}</body></html>"
 
 
+def topic_page_html(posts, uid=109991):
+    """构造帖子页：导航里带「欢迎回来 , <用户名>」（当前 uid），每楼一个 pidNNNbody。
+
+    posts: [(作者 uid, 发帖时间, 正文), ...]
+    结构与现场页面一致（2026-10-17 抓的 topicid=78668）：作者链接在楼层头、正文在
+    `<div id="pidNNNbody">` 里，左侧资料栏不含 userdetails 链接。
+    """
+    parts = [
+        '<html><body><span class="medium">欢迎回来 , <span class="nowrap">'
+        f'<a href="userdetails.php?id={uid}" class=\'PowerUser_Name\'><b>me</b></a>'
+        '</span> [<a href="logout.php">退出</a>]</span>'
+    ]
+    for i, (author, when, text) in enumerate(posts):
+        parts.append(
+            f'<a href="forums.php?action=viewtopic&amp;topicid=1005&amp;page=p{i}#pid{i}">#{i}</a>'
+            f'<span class="nowrap"><a href="userdetails.php?id={author}" '
+            f"class='PowerUser_Name'><b>u{author}</b></a></span>"
+            f'<span title="{when}">刚刚</span>'
+            f'<div id="pid{i}body">{text}</div>'
+        )
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
 def make_cfg(**overrides):
     base = dict(
         cookie="c_secure_uid=fake; c_secure_pass=fake",
@@ -1604,6 +1628,154 @@ class ComboExecutionTests(unittest.TestCase):
             state = chase.State(bet_topicids=[(1005, "大"), (1005, "小")])
             chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
         self.assertEqual(transport.post_calls, [])
+
+
+class ComboTimeoutVerificationTests(unittest.TestCase):
+    """现场 2026-10-17 16:30:37：combo 第二注 POST 读超时 → 判「结果不明」→ 整轮只落单边、进程退出。
+
+    真实情况是可以查清的：读一次帖子页就知道这一注到底落没落单。
+    """
+
+    def _cfg(self, tmp):
+        return make_cfg(
+            mode="combo",
+            combo_amount=100,
+            combo_types=["大", "小"],
+            dry_run=False,
+            state_file=os.path.join(tmp, "state.json"),
+        )
+
+    def test_second_bet_timeout_but_already_on_forum_counts_as_success(self):
+        """第二注读超时，但帖子页上已经有我方这条 —— 按成功继续，绝不重复下注。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            page = topic_page_html(
+                [
+                    (109991, "2026-10-17 16:30:14", "大 100"),
+                    (109991, "2026-10-17 16:30:40", "小 100"),
+                ]
+            )
+            transport = FakeTransport(
+                get_results=[chase.HttpResponse(200, page)],
+                post_results=[
+                    chase.HttpResponse(302, ""),  # 大 成功
+                    chase.DiceNetworkError("The read operation timed out"),  # 小 读超时
+                ],
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+
+        self.assertEqual(len(transport.post_calls), 2)  # 没有补发
+        self.assertEqual(state.bet_topicids, [(1005, "大"), (1005, "小")])
+        self.assertEqual(state.total_staked, 200)
+        self.assertEqual(state.consecutive_bets, 1)
+
+    def test_second_bet_timeout_confirmed_absent_reposts_once(self):
+        """读两次都确认没有我方这条 → 判定没落单，按节奏补发。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            page = topic_page_html([(109991, "2026-10-17 16:30:14", "大 100")])
+            transport = FakeTransport(
+                get_results=[chase.HttpResponse(200, page)] * chase.VERIFY_ABSENT_READS,
+                post_results=[
+                    chase.HttpResponse(302, ""),
+                    chase.DiceNetworkError("The read operation timed out"),
+                    chase.HttpResponse(302, ""),  # 补发成功
+                ],
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+
+        self.assertEqual(len(transport.post_calls), 3)
+        self.assertEqual(state.bet_topicids, [(1005, "大"), (1005, "小")])
+        self.assertEqual(state.consecutive_bets, 1)
+
+    def test_second_bet_timeout_unverifiable_stops_for_manual_check(self):
+        """帖子页也读不到 → 仍然只能判「结果不明」停手，交人工核对。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            transport = FakeTransport(
+                get_results=[chase.DiceNetworkError("boom")] * chase.VERIFY_READ_ATTEMPTS,
+                post_results=[
+                    chase.HttpResponse(302, ""),
+                    chase.DiceNetworkError("The read operation timed out"),
+                ],
+            )
+            client, _ = fake_client(transport)
+            state = chase.State()
+            with self.assertRaises(chase.StopRun) as ctx:
+                chase.place_combo_for_round(cfg, client, state, cfg.state_file, 1005, set())
+
+        self.assertEqual(ctx.exception.code, 4)
+        self.assertEqual(len(transport.post_calls), 2)  # 没核实清楚就不敢补发
+        self.assertEqual(state.bet_topicids, [(1005, "大")])
+
+    def test_other_users_same_text_does_not_count_as_our_bet(self):
+        """别人也发「小 100」：只认我方 uid，否则会把没落单当成已落单、漏掉补发。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            page = topic_page_html([(110065, "2026-10-17 16:30:44", "小 100")])
+            transport = FakeTransport(
+                get_results=[chase.HttpResponse(200, page)] * chase.VERIFY_ABSENT_READS,
+                post_results=[chase.HttpResponse(302, "")],
+            )
+            client, _ = fake_client(transport)
+
+            self.assertFalse(client.verify_bet_landed(1005, "小", 100))
+
+    def test_second_bet_waits_past_forum_min_post_interval(self):
+        """论坛同一用户两次发帖的真实最小间隔实测 4–12 秒（12 秒才稳落单）。
+
+        3 秒的首延会让第二注必然撞限流，而限流这次表现为把响应挂住 → 读超时。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            times = []
+            clock = {"now": 0.0}
+
+            class Transport:
+                def post(self, url, form):
+                    times.append(clock["now"])
+                    return chase.HttpResponse(302, "")
+
+                def get(self, url):  # pragma: no cover - 两注都成功，不需要核实
+                    raise AssertionError("本用例不该发 GET")
+
+            client = chase.ForumClient(
+                Transport(), sleep=lambda s: clock.__setitem__("now", clock["now"] + s),
+                clock=lambda: clock["now"],
+            )
+            chase.place_combo_for_round(cfg, client, chase.State(), cfg.state_file, 1005, set())
+
+        self.assertGreaterEqual(times[1] - times[0], 12.0)
+
+
+class HalfHedgedWarningTests(unittest.TestCase):
+    """半边注不自动补（用户 2026-10-17 决定）：只在启动时把最近那一轮打出来。"""
+
+    def test_warns_only_about_latest_round_missing_a_type(self):
+        state = chase.State(bet_topicids=[(1004, "大"), (1005, "大")])
+        cfg = make_cfg(mode="combo", combo_types=["大", "小"])
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        chase.LOG.addHandler(handler)
+        previous_level = chase.LOG.level
+        chase.LOG.setLevel(logging.WARNING)
+        self.addCleanup(chase.LOG.removeHandler, handler)
+        self.addCleanup(chase.LOG.setLevel, previous_level)
+
+        chase.warn_half_hedged(state, cfg)
+
+        out = stream.getvalue()
+        self.assertIn("1005", out)
+        self.assertIn("小", out)
+        self.assertNotIn("1004", out)  # 老轮次不刷屏
+
+    def test_silent_for_chase_mode_and_complete_rounds(self):
+        complete = chase.State(bet_topicids=[(1005, "大"), (1005, "小")])
+        chase.warn_half_hedged(complete, make_cfg(mode="combo"))
 
 
 class ComboDecideTests(unittest.TestCase):

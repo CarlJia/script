@@ -29,7 +29,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from html import unescape as html_unescape
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 LOG = logging.getLogger("dice_chase")
 
@@ -58,13 +59,21 @@ RETRY_DELAY_S = 10.0
 RETRY_MAX_ATTEMPTS = 12
 # combo 模式第二注及之后的重试节奏（与 user.js 一键大小按钮 SECOND_BET_* 一致）
 # 实测论坛对同一用户两次发帖的最小间隔在 4–12 秒之间（~4s 必被拒,12s 已能落单）:
-# 第二注的第一次尝试（3s）多半被拒,靠第二次尝试（再等 10s）落单。
-COMBO_FIRST_DELAY_S = 3.0
+# 旧值 3s 让第二注必然撞限流，而限流有时表现为「响应被挂住」→ 15s 读超时 → 整个进程以
+# 「结果不明」停手（现场 2026-10-17 16:30:37）。首延直接取实测能落单的 12s。
+COMBO_FIRST_DELAY_S = 12.0
 COMBO_RETRY_DELAY_S = 10.0
 COMBO_MAX_ATTEMPTS = 12
 # 客户端自己设的两次 POST 之间的下限。论坛实际下限更高（见上面 COMBO_* 的实测），
 # 单注路径靠它防连击；combo 第二注的间隔由 COMBO_* 的重试节奏兜住。
 MIN_POST_INTERVAL_S = 3.0
+
+# POST 读超时后「这一注到底落没落单」的核实节奏：读帖子页判定，读不到就停手不动钱。
+VERIFY_READ_ATTEMPTS = 4
+VERIFY_RETRY_DELAY_S = 5.0  # 帖子页读不到时间隔多久再读
+VERIFY_RECHECK_DELAY_S = 5.0  # 读到了但没有我方这条，隔多久再读一次确认
+VERIFY_ABSENT_READS = 2  # 连续几次「读到了但没有」才敢判定没落单
+VERIFY_REPOST_LIMIT = 1  # 确认没落单后最多补发几次
 
 DEFAULT_POLL_INTERVAL_S = 15.0
 DEFAULT_MIN_POLL_INTERVAL_S = 3.0
@@ -100,6 +109,14 @@ REFUSAL_TEXT_RE = re.compile(r"请不要连续发帖|不能连续发帖|发帖�
 BODY_SNIPPET_LEN = 300
 
 LIST_ROUND_MARKER = "本轮开奖时间"
+
+# 帖子页（核实一注到底落没落单时读它）。楼层正文在 <div id="pidNNNbody">…</div>，
+# 作者与发帖时间取该 div 之前最近的一条 —— 左侧资料栏里没有 userdetails 链接。
+TOPIC_PATH = "/forums.php?action=viewtopic&forumid={forumid}&topicid={topicid}"
+WELCOME_MARKER = "欢迎回来"
+TOPIC_BODY_RE = re.compile(r'<div id="pid\d+body">(.*?)</div>', re.DOTALL)
+USER_ID_RE = re.compile(r"userdetails\.php\?id=(\d+)")
+POST_TIME_RE = re.compile(r'<span title="(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})">')
 
 
 # --------------------------------------------------------------------- 异常
@@ -450,6 +467,49 @@ class ForumClient:
                 self._sleep(delay)
         raise AssertionError("unreachable: attempts >= 1")
 
+    def fetch_topic_page(self, topicid: int) -> str:
+        """读一个帖子页（只读）。非 200 当作传输层失败，由核实逻辑决定要不要再读。"""
+        url = f"{BASE_URL}{TOPIC_PATH.format(forumid=FORUM_ID, topicid=topicid)}"
+        response = self._transport.get(url)
+        if response.status != 200:
+            raise DiceNetworkError(f"帖子页返回 {response.status}")
+        return response.body
+
+    def verify_bet_landed(
+        self, topicid: int, bet_type: str, amount: int, attempts: int = VERIFY_READ_ATTEMPTS
+    ) -> Optional[bool]:
+        """POST 结果读不回来时，读帖子页判定这一注到底落没落单。
+
+        True  已落单（有自己的楼层，正文对得上）
+        False 确认没落单（读到页面，连续 VERIFY_ABSENT_READS 次都没有我方这条）
+        None  查不清（页面读不到 / 取不到自己的 uid）—— 调用方按「结果不明」停手
+
+        报 False 必须有页面在手：宁可判「查不清」，也不把没核实当成「没落单」去补发，
+        那会变成重复下注。
+        """
+        wanted = f"{bet_type} {amount}"
+        absent_reads = 0
+        for attempt in range(1, attempts + 1):
+            try:
+                page = self.fetch_topic_page(topicid)
+            except DiceChaseError:
+                page = None
+            if page is None:
+                if attempt < attempts:
+                    self._sleep(VERIFY_RETRY_DELAY_S)
+                continue
+            uid = current_user_id(page)
+            if uid is None:
+                return None
+            if any(uid == post[0] and post[2] == wanted for post in parse_topic_posts(page)):
+                return True
+            absent_reads += 1
+            if absent_reads >= VERIFY_ABSENT_READS:
+                return False
+            if attempt < attempts:
+                self._sleep(VERIFY_RECHECK_DELAY_S)
+        return None
+
     # -- 写 ---------------------------------------------------------------
     def place_bet(self, topicid: int, bet_type: str, amount: int) -> None:
         """下注一次。成功即返回；失败抛 BetRejected（限流拒绝，可重试）、
@@ -528,6 +588,36 @@ def body_snippet(html: str, limit: int = BODY_SNIPPET_LEN) -> str:
     响应正文里没有请求头，不会带出 Cookie（见 R20）。
     """
     return re.sub(r"\s+", " ", html or "").strip()[:limit]
+
+
+def current_user_id(html: str) -> Optional[int]:
+    """从页面导航「欢迎回来 , <用户名>」里取当前登录用户的 uid。
+
+    核实下注要用它把「我方楼层」和别人同文本的楼层分开。
+    """
+    index = (html or "").find(WELCOME_MARKER)
+    if index < 0:
+        return None
+    match = USER_ID_RE.search(html, index)
+    return int(match.group(1)) if match else None
+
+
+def parse_topic_posts(html: str) -> List[Tuple[int, str, str]]:
+    """解析帖子页每层楼的 (作者 uid, 发帖时间, 正文)。
+
+    作者与时间取正文 div 之前最近的一条，避免把导航或左侧资料栏里的链接算成作者。
+    """
+    posts: List[Tuple[int, str, str]] = []
+    cursor = 0
+    for match in TOPIC_BODY_RE.finditer(html or ""):
+        window = html[cursor : match.start()]
+        authors = USER_ID_RE.findall(window)
+        times = POST_TIME_RE.findall(window)
+        if authors:
+            text = re.sub(r"\s+", " ", TAG_RE.sub(" ", html_unescape(match.group(1)))).strip()
+            posts.append((int(authors[-1]), times[-1] if times else "", text))
+        cursor = match.end()
+    return posts
 
 
 def place_combo_bet_until_accepted(
@@ -1033,6 +1123,9 @@ def place_combo_for_round(
     否则进程被强杀后重启会读不到第一注、对这一轮重复下注（评审 #1）。
     失败处置:BetUncertain → StopRun(4);认得出的拒绝页在重试上限后仍被拒 → StopRun(5);
     认不出的 200（含第二注重试耗尽）→ 放弃本轮剩余类型、继续轮询。
+
+    POST 读超时（结果没读回来）不再直接判「结果不明」：先读帖子页核实这一注到底落没落单，
+    已落单按成功继续、确认没落单才补发一次、核实不了才停手（见 verify_bet_landed）。
     """
     assert cfg.mode == "combo", "place_combo_for_round 仅在 combo 模式调用"
 
@@ -1063,43 +1156,73 @@ def place_combo_for_round(
                 b,
             )
         )
-        try:
-            if is_first:
-                client.place_bet_until_accepted(
-                    topicid, btype, cfg.combo_amount, on_attempt=on_attempt
+        reposts_left = VERIFY_REPOST_LIMIT
+        while True:
+            try:
+                if is_first:
+                    client.place_bet_until_accepted(
+                        topicid, btype, cfg.combo_amount, on_attempt=on_attempt
+                    )
+                else:
+                    place_combo_bet_until_accepted(
+                        client,
+                        topicid,
+                        btype,
+                        cfg.combo_amount,
+                        on_attempt=on_attempt,
+                        stop=stop,
+                    )
+            except (BetUncertain, DiceNetworkError) as exc:
+                # 读超时只说明「结果没读回来」，不说明没落单：先读帖子页核实。
+                # 核实到已落单 → 按成功继续；核实到确实没有 → 补发一次；
+                # 核实不了（帖子页也读不到）→ 维持「结果不明」停手，不动钱。
+                landed = client.verify_bet_landed(topicid, btype, cfg.combo_amount)
+                if landed is True:
+                    LOG.info(
+                        "[combo] 帖子页已核实：%s %s @ topicid=%s 落单了（%s），按成功继续",
+                        btype,
+                        cfg.combo_amount,
+                        topicid,
+                        exc,
+                    )
+                    break
+                if landed is False and reposts_left > 0:
+                    reposts_left -= 1
+                    LOG.warning(
+                        "[combo] 帖子页已核实：上一注没落单，按节奏补发 %s %s @ topicid=%s",
+                        btype,
+                        cfg.combo_amount,
+                        topicid,
+                    )
+                    continue
+                save_state(state_path, state)
+                LOG.error(
+                    "[combo] 下注结果不明，已停手，请人工核对论坛侧是否已收到这一注: %s",
+                    exc,
                 )
-            else:
-                place_combo_bet_until_accepted(
-                    client, topicid, btype, cfg.combo_amount, on_attempt=on_attempt, stop=stop
+                raise StopRun(4) from exc
+            except BetRejected as exc:
+                save_state(state_path, state)
+                max_attempts = RETRY_MAX_ATTEMPTS if is_first else COMBO_MAX_ATTEMPTS
+                LOG.error(
+                    "[combo] 论坛拒绝下注，重试 %s 次后仍失败: %s",
+                    max_attempts,
+                    exc.reason,
                 )
-        except (BetUncertain, DiceNetworkError) as exc:
-            save_state(state_path, state)
-            LOG.error(
-                "[combo] 下注结果不明，已停手，请人工核对论坛侧是否已收到这一注: %s",
-                exc,
-            )
-            raise StopRun(4) from exc
-        except BetRejected as exc:
-            save_state(state_path, state)
-            max_attempts = RETRY_MAX_ATTEMPTS if is_first else COMBO_MAX_ATTEMPTS
-            LOG.error(
-                "[combo] 论坛拒绝下注，重试 %s 次后仍失败: %s",
-                max_attempts,
-                exc.reason,
-            )
-            raise StopRun(5) from exc
-        except BetNotAccepted as exc:
-            # 该轮已不再收帖（锁定/已满/已开奖）：放弃本轮剩余类型并记到本轮询的 refused_rounds,
-            # 进程继续跑;若该轮之后仍开放,下一轮轮询直接跳过,不再重复下注
-            if topicid not in state.refused_rounds:
-                state.refused_rounds.append(topicid)
-            save_state(state_path, state)
-            LOG.warning(
-                "[combo] 论坛没有收下这一注，放弃本轮剩余类型"
-                "（下一轮轮询会重新评估该轮）: %s",
-                exc.reason,
-            )
-            return
+                raise StopRun(5) from exc
+            except BetNotAccepted as exc:
+                # 该轮已不再收帖（锁定/已满/已开奖）：放弃本轮剩余类型并记到本轮询的 refused_rounds,
+                # 进程继续跑;若该轮之后仍开放,下一轮轮询直接跳过,不再重复下注
+                if topicid not in state.refused_rounds:
+                    state.refused_rounds.append(topicid)
+                save_state(state_path, state)
+                LOG.warning(
+                    "[combo] 论坛没有收下这一注，放弃本轮剩余类型"
+                    "（下一轮轮询会重新评估该轮）: %s",
+                    exc.reason,
+                )
+                return
+            break
 
         state.bet_topicids.append((topicid, btype))
         state.bet_topicids = state.bet_topicids[-MAX_REMEMBERED_BETS:]
@@ -1272,6 +1395,30 @@ def validate_session(client: ForumClient) -> None:
     client.fetch_list_page_with_retry(1)
 
 
+def warn_half_hedged(state: State, cfg: Config) -> None:
+    """combo 模式：把最近一轮「只落了一部分类型」的情况打出来。
+
+    半边注不会自动补（2026-10-17 决定）：开奖后帖子就锁了，补腿最容易补在已锁定的轮上白花
+    积分；这里只报警，由人决定要不要在开奖前手动补。只提最近一轮，老轮次不刷屏。
+    """
+    if cfg.mode != "combo" or not state.bet_topicids:
+        return
+    covered: Dict[int, set] = {}
+    for topicid, btype in state.bet_topicids:
+        covered.setdefault(topicid, set()).add(btype)
+    latest = max(covered)
+    missing = [btype for btype in cfg.combo_types if btype not in covered[latest]]
+    if not missing:
+        return
+    LOG.warning(
+        "上一轮 topicid=%s 只落了 %s，缺 %s；半边注不会自动补 —— "
+        "该轮还没开奖就手动补上，否则这一轮只有单边",
+        latest,
+        "、".join(sorted(covered[latest])),
+        "、".join(missing),
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
@@ -1295,6 +1442,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOG.warning("%s", note)
     if reset_run_state(state):
         LOG.info("本次启动重置追号态：armed、连续下注计数与累计投入清零,阈值与投入上限重新评估")
+    warn_half_hedged(state, cfg)
 
     client = ForumClient(UrllibTransport(cfg.cookie, cfg.user_agent))
 
